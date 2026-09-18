@@ -1,0 +1,25 @@
+[project]
+name = "local-tts-bot"
+version = "0.1.0"
+description = "Minimal local Pipecat runner for benchmarking custom Modal TTS endpoints"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.11",
+    "pipecat-ai[openai]==1.10.0",
+    "psutil>=6.0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.11",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

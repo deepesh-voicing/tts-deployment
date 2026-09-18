@@ -1,0 +1,104 @@
+benchmark:
+  # Set this only when comparing achieved TTS requests/second with an intended rate.
+  intended_request_rate_rps:
+  # A blank value disables that threshold. Rates are percentages, latencies are milliseconds.
+  thresholds:
+    retry_rate_pct_max:
+    final_failure_rate_pct_max:
+    playable_ttfa_p95_ms_max:
+    playable_ttfa_p99_ms_max:
+    playable_ttfa_p99_9_ms_max:
+    playback_gap_rate_pct_max:
+    rtf_p95_max:
+    request_rate_achievement_pct_min:
+
+scenarios:
+  - name: greeting
+    turns:
+      - prompt: "Reply exactly with: Thank you for calling. How can I help you today?"
+        wait_after_seconds: 3
+      - prompt: "Reply exactly with: Certainly. I can help you with that request."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: Is there anything else you would like help with?"
+        wait_after_seconds: 3
+
+  - name: order-status
+    turns:
+      - prompt: "Reply exactly with: Your order has shipped and is currently in transit."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: The estimated delivery date is September eighteenth."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: I will send the tracking details to you now."
+        wait_after_seconds: 3
+
+  - name: appointment
+    turns:
+      - prompt: "Reply exactly with: I can schedule your appointment for Tuesday at ten thirty in the morning."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: Please arrive fifteen minutes before your appointment."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: Your appointment is confirmed."
+        wait_after_seconds: 3
+
+  - name: payment
+    turns:
+      - prompt: "Reply exactly with: Your outstanding balance is one hundred twenty four dollars and fifty cents."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: The payment was received successfully on August twenty first."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: A receipt will be sent to your registered email address."
+        wait_after_seconds: 3
+
+  - name: identifiers
+    turns:
+      - prompt: "Reply exactly with: Your reference number is A B dash one nine four two."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: Please verify the last four digits, seven three zero nine."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: The case identifier has been verified."
+        wait_after_seconds: 3
+
+  - name: technical-support
+    turns:
+      - prompt: "Reply exactly with: Please restart the router and wait for the green light to stop blinking."
+        wait_after_seconds: 6
+      - prompt: "Reply exactly with: Now reconnect your device to the wireless network."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: Your connection should now be working normally."
+        wait_after_seconds: 3
+
+  - name: urgent-support
+    turns:
+      - prompt: "Reply exactly with: I understand this is urgent, and I am checking it immediately."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: Please stay on the line while I review the details."
+        wait_after_seconds: 6
+      - prompt: "Reply exactly with: Thank you for waiting. The issue has now been resolved."
+        wait_after_seconds: 3
+
+  - name: address
+    turns:
+      - prompt: "Reply exactly with: The delivery address is forty two Park Avenue, apartment seven B."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: The postal code is one zero zero one six."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: I have updated and confirmed the delivery address."
+        wait_after_seconds: 3
+
+  - name: multilingual
+    turns:
+      - prompt: "Reply exactly with: Hello and namaste. Thank you for contacting customer support."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: Gracias. Your request has been completed successfully."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: Merci beaucoup. Have a wonderful day."
+        wait_after_seconds: 3
+
+  - name: long-response
+    turns:
+      - prompt: "Reply exactly with: I reviewed your account, confirmed the recent transaction, and updated the contact information you provided. Everything is now ready, and no further action is required from you."
+        wait_after_seconds: 7
+      - prompt: "Reply exactly with: If you notice another unexpected charge, contact us with the transaction date, amount, and reference number so that we can investigate it quickly."
+        wait_after_seconds: 7
+      - prompt: "Reply exactly with: Thank you for your patience while we completed these checks."
+        wait_after_seconds: 3

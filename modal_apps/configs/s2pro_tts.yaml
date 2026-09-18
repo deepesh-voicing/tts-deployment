@@ -1,0 +1,8 @@
+config_cls: S2ProPipelineConfig
+model_path: fishaudio/s2-pro
+stages:
+  tts_engine:
+    engine:
+      max_running_requests: 32
+      cuda_graph_max_bs: 32
+      kv_cache_bytes: 20GiB
