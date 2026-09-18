@@ -22,6 +22,7 @@ VLLM_OMNI_IMAGE = (
 
 GPU = "L40S"
 VLLM_PORT = 8000
+MODAL_SERVER_PORT = 8080
 MAX_INPUTS = 128
 MAX_CONTAINERS = 1
 SCALEDOWN_WINDOW_SECONDS = 300
@@ -35,6 +36,14 @@ DEFAULT_STAGE_OVERRIDES = (
 AP_STAGE_OVERRIDES = (
     '{"0":{"max_num_seqs":64,"kv_cache_dtype":"fp8_e4m3"},'
     '"1":{"max_num_seqs":8}}'
+)
+AP_SOUTH_STAGE_OVERRIDES = (
+    '{"0":{"max_num_seqs":64,"kv_cache_dtype":"fp8_e4m3"},'
+    '"1":{"max_num_seqs":32}}'
+)
+MODAL_SERVER_STAGE_OVERRIDES = (
+    '{"0":{"max_num_seqs":64,"kv_cache_dtype":"fp8_e4m3"},'
+    '"1":{"max_num_seqs":12}}'
 )
 STAGE_UTILIZATION_LOG_INTERVAL_SECONDS = 1.0
 GPU_UTILIZATION_LOG_INTERVAL_SECONDS = 1.0
@@ -159,6 +168,19 @@ def _parse_prometheus_labels(raw_labels: str) -> dict[str, str]:
     for match in _PROMETHEUS_LABEL_RE.finditer(raw_labels):
         labels[match.group(1)] = json.loads(match.group(2))
     return labels
+
+
+def _log_timing_summary(
+    serialize_started_ns: int,
+    write_started_ns: int,
+    completed_ns: int,
+) -> dict[str, float]:
+    """Return serialization and blocking stdout-write durations."""
+    return {
+        "serialize_ms": round((write_started_ns - serialize_started_ns) / 1_000_000, 3),
+        "write_ms": round((completed_ns - write_started_ns) / 1_000_000, 3),
+        "total_ms": round((completed_ns - serialize_started_ns) / 1_000_000, 3),
+    }
 
 
 def _finite_float(raw_value: str) -> float | None:
@@ -526,7 +548,7 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
     import av
     import httpx
     import numpy as np
-    from fastapi import FastAPI, Request, Response
+    from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
     from fastapi.responses import StreamingResponse
 
     vllm_command = [
@@ -774,26 +796,32 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
         *,
         event_wall_ns: int | None = None,
         **fields,
-    ) -> None:
+    ) -> dict[str, float]:
         timestamp_ns = event_wall_ns if event_wall_ns is not None else time.time_ns()
-        print(
-            json.dumps(
-                {
-                    "event": "tts_timeline",
-                    "component": "modal_wrapper",
-                    "trace_id": trace_id,
-                    "phase": phase,
-                    "wall_time_ns": timestamp_ns,
-                    "elapsed_from_handler_ms": round(
-                        (timestamp_ns - handler_entry_ns) / 1_000_000,
-                        3,
-                    ),
-                    **fields,
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            ),
-            flush=True,
+        serialize_started_ns = time.perf_counter_ns()
+        message = json.dumps(
+            {
+                "event": "tts_timeline",
+                "component": "modal_wrapper",
+                "trace_id": trace_id,
+                "phase": phase,
+                "wall_time_ns": timestamp_ns,
+                "elapsed_from_handler_ms": round(
+                    (timestamp_ns - handler_entry_ns) / 1_000_000,
+                    3,
+                ),
+                **fields,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        write_started_ns = time.perf_counter_ns()
+        print(message, flush=True)
+        completed_ns = time.perf_counter_ns()
+        return _log_timing_summary(
+            serialize_started_ns,
+            write_started_ns,
+            completed_ns,
         )
 
     @api.get("/metrics")
@@ -828,8 +856,13 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
         turn_number = int(turn_number_header) if turn_number_header.isdigit() else None
         handler_entry_ns = time.time_ns()
 
-        def log_phase(phase: str, *, event_wall_ns: int | None = None, **fields) -> None:
-            log_tts_timeline(
+        def log_phase(
+            phase: str,
+            *,
+            event_wall_ns: int | None = None,
+            **fields,
+        ) -> dict[str, float]:
+            return log_tts_timeline(
                 trace_id,
                 phase,
                 handler_entry_ns,
@@ -852,9 +885,14 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
         if turn_number is not None:
             trace_headers["X-Turn-Number"] = str(turn_number)
 
-        log_phase("handler_entry", event_wall_ns=handler_entry_ns)
+        handler_entry_log_timing = log_phase(
+            "handler_entry",
+            event_wall_ns=handler_entry_ns,
+        )
 
+        request_body_read_started_ns = time.perf_counter_ns()
         payload = await request.json()
+        request_body_read_completed_ns = time.perf_counter_ns()
         request_body_received_ns = time.time_ns()
         input_text = payload.get("input")
         input_text_characters = len(input_text) if isinstance(input_text, str) else None
@@ -881,6 +919,14 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             event_wall_ns=request_body_received_ns,
             input_text_characters=input_text_characters,
             input_text_utf8_bytes=input_text_utf8_bytes,
+            handler_entry_log_serialize_ms=handler_entry_log_timing["serialize_ms"],
+            handler_entry_log_write_ms=handler_entry_log_timing["write_ms"],
+            handler_entry_log_total_ms=handler_entry_log_timing["total_ms"],
+            request_body_read_ms=round(
+                (request_body_read_completed_ns - request_body_read_started_ns)
+                / 1_000_000,
+                3,
+            ),
         )
         log_phase(
             "upstream_request_built",
@@ -1081,6 +1127,419 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             },
         )
 
+    @api.websocket("/v1/audio/speech/ws")
+    async def speech_websocket(websocket: WebSocket):
+        """Stream sequential TTS turns over one persistent WebSocket."""
+        await websocket.accept()
+        connection_id = uuid.uuid4().hex
+        connection_opened_ns = time.time_ns()
+        print(
+            json.dumps(
+                {
+                    "event": "tts_websocket_connection",
+                    "phase": "open",
+                    "connection_id": connection_id,
+                    "wall_time_ns": connection_opened_ns,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        request_count = 0
+
+        try:
+            while True:
+                raw_message = await websocket.receive_text()
+                websocket_receive_ns = time.time_ns()
+                decode_started_ns = time.perf_counter_ns()
+                try:
+                    message = json.loads(raw_message)
+                except json.JSONDecodeError as exc:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "error": "invalid_json",
+                            "detail": str(exc)[:500],
+                        }
+                    )
+                    continue
+                decode_completed_ns = time.perf_counter_ns()
+
+                if message.get("type") == "ping":
+                    await websocket.send_json(
+                        {
+                            "type": "pong",
+                            "client_wall_time_ns": message.get("client_wall_time_ns"),
+                            "server_wall_time_ns": websocket_receive_ns,
+                        }
+                    )
+                    continue
+                if message.get("type") != "synthesize":
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "error": "unsupported_message_type",
+                            "detail": "Expected type=synthesize or type=ping",
+                        }
+                    )
+                    continue
+
+                request_count += 1
+                trace_id = str(message.get("trace_id") or uuid.uuid4().hex)[:128]
+                attempt_id = str(message.get("attempt_id") or uuid.uuid4().hex)[:128]
+                attempt_number = message.get("attempt_number")
+                bot_number = message.get("bot_number")
+                turn_number = message.get("turn_number")
+                handler_entry_ns = websocket_receive_ns
+
+                def log_phase(
+                    phase: str,
+                    *,
+                    event_wall_ns: int | None = None,
+                    _trace_id: str = trace_id,
+                    _handler_entry_ns: int = handler_entry_ns,
+                    _request_count: int = request_count,
+                    _attempt_id: str = attempt_id,
+                    _attempt_number=attempt_number,
+                    _bot_number=bot_number,
+                    _turn_number=turn_number,
+                    **fields,
+                ) -> dict[str, float]:
+                    return log_tts_timeline(
+                        _trace_id,
+                        phase,
+                        _handler_entry_ns,
+                        event_wall_ns=event_wall_ns,
+                        transport="websocket",
+                        connection_id=connection_id,
+                        request_on_connection=_request_count,
+                        attempt_id=_attempt_id,
+                        attempt_number=_attempt_number,
+                        bot_number=_bot_number,
+                        turn_number=_turn_number,
+                        **fields,
+                    )
+
+                log_phase(
+                    "websocket_receive",
+                    event_wall_ns=websocket_receive_ns,
+                    websocket_message_bytes=len(raw_message.encode("utf-8")),
+                    websocket_decode_ms=round(
+                        (decode_completed_ns - decode_started_ns) / 1_000_000,
+                        3,
+                    ),
+                    client_send_started_wall_ns=message.get(
+                        "client_send_started_wall_ns"
+                    ),
+                )
+                await websocket.send_json(
+                    {
+                        "type": "accepted",
+                        "trace_id": trace_id,
+                        "attempt_id": attempt_id,
+                        "connection_id": connection_id,
+                        "request_on_connection": request_count,
+                        "websocket_receive_wall_ns": websocket_receive_ns,
+                    }
+                )
+
+                payload = message.get("payload")
+                if not isinstance(payload, dict):
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "trace_id": trace_id,
+                            "attempt_id": attempt_id,
+                            "error": "invalid_payload",
+                            "detail": "payload must be a JSON object",
+                        }
+                    )
+                    continue
+
+                payload = dict(payload)
+                input_text = payload.get("input")
+                input_text_characters = (
+                    len(input_text) if isinstance(input_text, str) else None
+                )
+                input_text_utf8_bytes = (
+                    len(input_text.encode("utf-8"))
+                    if isinstance(input_text, str)
+                    else None
+                )
+                payload["model"] = MODEL_ID
+                payload["task_type"] = "CustomVoice"
+                payload.setdefault("voice", "aiden")
+                payload["response_format"] = "pcm"
+                payload["stream"] = True
+                payload["stream_format"] = "audio"
+
+                trace_headers = {
+                    "X-Trace-Id": trace_id,
+                    "X-Attempt-Id": attempt_id,
+                }
+                if attempt_number is not None:
+                    trace_headers["X-Attempt-Number"] = str(attempt_number)
+                if bot_number is not None:
+                    trace_headers["X-Bot-Number"] = str(bot_number)
+                if turn_number is not None:
+                    trace_headers["X-Turn-Number"] = str(turn_number)
+
+                upstream_request = websocket.app.state.vllm_client.build_request(
+                    "POST",
+                    f"http://127.0.0.1:{VLLM_PORT}/v1/audio/speech",
+                    json=payload,
+                    headers=trace_headers,
+                )
+                upstream_request_built_ns = time.time_ns()
+                log_phase(
+                    "upstream_request_built",
+                    event_wall_ns=upstream_request_built_ns,
+                    input_text_characters=input_text_characters,
+                    input_text_utf8_bytes=input_text_utf8_bytes,
+                    request_construction_ms=round(
+                        (upstream_request_built_ns - websocket_receive_ns) / 1_000_000,
+                        3,
+                    ),
+                )
+                vllm_request_sent_ns = time.time_ns()
+                log_phase(
+                    "vllm_request_sent",
+                    event_wall_ns=vllm_request_sent_ns,
+                )
+                try:
+                    upstream = await websocket.app.state.vllm_client.send(
+                        upstream_request,
+                        stream=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - return a protocol error frame
+                    log_phase(
+                        "error",
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:500],
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "trace_id": trace_id,
+                            "attempt_id": attempt_id,
+                            "error": type(exc).__name__,
+                            "detail": str(exc)[:500],
+                            "websocket_receive_wall_ns": websocket_receive_ns,
+                            "vllm_request_sent_wall_ns": vllm_request_sent_ns,
+                        }
+                    )
+                    continue
+
+                log_phase(
+                    "vllm_response_headers",
+                    status_code=upstream.status_code,
+                )
+                await websocket.send_json(
+                    {
+                        "type": "ready",
+                        "trace_id": trace_id,
+                        "attempt_id": attempt_id,
+                        "status_code": upstream.status_code,
+                        "sample_rate": OUTPUT_SAMPLE_RATE,
+                        "sample_format": "s16le",
+                        "channels": 1,
+                        "websocket_receive_wall_ns": websocket_receive_ns,
+                        "upstream_request_built_wall_ns": upstream_request_built_ns,
+                        "vllm_request_sent_wall_ns": vllm_request_sent_ns,
+                    }
+                )
+                if upstream.status_code != 200:
+                    body = await upstream.aread()
+                    log_phase(
+                        "upstream_error",
+                        status_code=upstream.status_code,
+                    )
+                    await upstream.aclose()
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "trace_id": trace_id,
+                            "attempt_id": attempt_id,
+                            "error": f"http_{upstream.status_code}",
+                            "detail": body.decode(errors="replace")[:500],
+                        }
+                    )
+                    continue
+
+                resampler = av.AudioResampler(
+                    format="s16",
+                    layout="mono",
+                    rate=OUTPUT_SAMPLE_RATE,
+                )
+                remainder = b""
+                first_24khz_ns = None
+                first_8khz_ns = None
+                input_bytes = 0
+                output_bytes = 0
+                upstream_chunks = 0
+                output_chunks = 0
+                previous_output_yield_ns = None
+                gap_count = 0
+                gap_total_ms = 0.0
+                max_gap_ms = 0.0
+                try:
+                    async for chunk in upstream.aiter_raw():
+                        if not chunk:
+                            continue
+                        upstream_chunks += 1
+                        input_bytes += len(chunk)
+                        if first_24khz_ns is None:
+                            first_24khz_ns = time.time_ns()
+                            log_phase(
+                                "first_24khz_chunk",
+                                event_wall_ns=first_24khz_ns,
+                                vllm_ttfa_ms=round(
+                                    (first_24khz_ns - vllm_request_sent_ns) / 1_000_000,
+                                    3,
+                                ),
+                                chunk_bytes=len(chunk),
+                            )
+                        pcm = remainder + chunk
+                        complete_bytes = len(pcm) - (len(pcm) % 2)
+                        remainder = pcm[complete_bytes:]
+                        if not complete_bytes:
+                            continue
+                        samples = np.frombuffer(pcm[:complete_bytes], dtype="<i2")
+                        frame = av.AudioFrame.from_ndarray(
+                            samples.reshape(1, -1),
+                            format="s16",
+                            layout="mono",
+                        )
+                        frame.sample_rate = SOURCE_SAMPLE_RATE
+                        for output in resampler.resample(frame):
+                            output_chunk = (
+                                output.to_ndarray().astype("<i2", copy=False).tobytes()
+                            )
+                            if not output_chunk:
+                                continue
+                            output_yield_ns = time.time_ns()
+                            output_chunks += 1
+                            output_bytes += len(output_chunk)
+                            if previous_output_yield_ns is not None:
+                                gap_ms = (
+                                    output_yield_ns - previous_output_yield_ns
+                                ) / 1_000_000
+                                gap_count += 1
+                                gap_total_ms += gap_ms
+                                max_gap_ms = max(max_gap_ms, gap_ms)
+                            previous_output_yield_ns = output_yield_ns
+                            if first_8khz_ns is None:
+                                first_8khz_ns = output_yield_ns
+                                log_phase(
+                                    "first_8khz_yield",
+                                    event_wall_ns=first_8khz_ns,
+                                    resampling_ms=round(
+                                        (first_8khz_ns - first_24khz_ns) / 1_000_000,
+                                        3,
+                                    ),
+                                    chunk_bytes=len(output_chunk),
+                                )
+                            await websocket.send_bytes(output_chunk)
+
+                    if remainder:
+                        raise RuntimeError("Upstream returned an incomplete PCM16 sample")
+
+                    for output in resampler.resample(None):
+                        output_chunk = (
+                            output.to_ndarray().astype("<i2", copy=False).tobytes()
+                        )
+                        if not output_chunk:
+                            continue
+                        output_yield_ns = time.time_ns()
+                        output_chunks += 1
+                        output_bytes += len(output_chunk)
+                        if previous_output_yield_ns is not None:
+                            gap_ms = (
+                                output_yield_ns - previous_output_yield_ns
+                            ) / 1_000_000
+                            gap_count += 1
+                            gap_total_ms += gap_ms
+                            max_gap_ms = max(max_gap_ms, gap_ms)
+                        previous_output_yield_ns = output_yield_ns
+                        if first_8khz_ns is None:
+                            first_8khz_ns = output_yield_ns
+                            log_phase(
+                                "first_8khz_yield",
+                                event_wall_ns=first_8khz_ns,
+                                resampling_ms=round(
+                                    (first_8khz_ns - first_24khz_ns) / 1_000_000,
+                                    3,
+                                ),
+                                chunk_bytes=len(output_chunk),
+                            )
+                        await websocket.send_bytes(output_chunk)
+
+                    complete_ns = time.time_ns()
+                    summary = _audio_observability_summary(
+                        handler_entry_ns=handler_entry_ns,
+                        vllm_request_sent_ns=vllm_request_sent_ns,
+                        complete_ns=complete_ns,
+                        first_24khz_ns=first_24khz_ns,
+                        first_8khz_ns=first_8khz_ns,
+                        input_bytes=input_bytes,
+                        output_bytes=output_bytes,
+                        upstream_chunks=upstream_chunks,
+                        output_chunks=output_chunks,
+                        gap_count=gap_count,
+                        gap_total_ms=gap_total_ms,
+                        max_gap_ms=max_gap_ms,
+                    )
+                    log_phase(
+                        "complete",
+                        event_wall_ns=complete_ns,
+                        **summary,
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "complete",
+                            "trace_id": trace_id,
+                            "attempt_id": attempt_id,
+                            "complete_wall_ns": complete_ns,
+                            "output_bytes": output_bytes,
+                            "output_chunks": output_chunks,
+                        }
+                    )
+                except BaseException as exc:
+                    log_phase(
+                        "error",
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:500],
+                        input_bytes=input_bytes,
+                        output_bytes=output_bytes,
+                        upstream_chunks=upstream_chunks,
+                        output_chunks=output_chunks,
+                    )
+                    raise
+                finally:
+                    await upstream.aclose()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            print(
+                json.dumps(
+                    {
+                        "event": "tts_websocket_connection",
+                        "phase": "close",
+                        "connection_id": connection_id,
+                        "wall_time_ns": time.time_ns(),
+                        "connection_lifetime_ms": round(
+                            (time.time_ns() - connection_opened_ns) / 1_000_000,
+                            3,
+                        ),
+                        "request_count": request_count,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
     return api
 
 
@@ -1135,4 +1594,51 @@ def serve_ap():
 @modal.concurrent(max_inputs=MAX_INPUTS)
 @modal.asgi_app()
 def serve_ap_south():
-    return _build_api(AP_STAGE_OVERRIDES, log_stage_utilization=True)
+    return _build_api(AP_SOUTH_STAGE_OVERRIDES, log_stage_utilization=True)
+
+
+@app.server(
+    name="serve-modal-server",
+    image=image,
+    gpu=GPU,
+    secrets=[huggingface_secret],
+    volumes={CACHE_PATH: cache_volume},
+    port=MODAL_SERVER_PORT,
+    target_concurrency=MAX_INPUTS,
+    min_containers=0,
+    max_containers=MAX_CONTAINERS,
+    scaledown_window=SCALEDOWN_WINDOW_SECONDS,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
+    compute_region="ap",
+    routing_region="ap-south",
+    unauthenticated=True,
+)
+class QwenTTSModalServer:
+    """Low-latency control deployment for POST versus ASGI Web Functions."""
+
+    @modal.enter()
+    def start(self):
+        import threading
+
+        import uvicorn
+
+        api = _build_api(MODAL_SERVER_STAGE_OVERRIDES, log_stage_utilization=True)
+        self._server = uvicorn.Server(
+            uvicorn.Config(
+                api,
+                host="0.0.0.0",
+                port=MODAL_SERVER_PORT,
+                log_level="info",
+            )
+        )
+        self._server_thread = threading.Thread(
+            target=self._server.run,
+            name="qwen-tts-modal-server",
+            daemon=True,
+        )
+        self._server_thread.start()
+
+    @modal.exit()
+    def stop(self):
+        self._server.should_exit = True
+        self._server_thread.join(timeout=25)

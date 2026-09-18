@@ -1,9 +1,10 @@
 # Qwen3-TTS observability
 
 This document describes the observability emitted by
-`modal_apps/deploy_qwen3_tts.py` for the `serve_ap_south` function. The other
-Qwen functions keep the same inference configuration but do not start the
-one-second observability tasks.
+`modal_apps/deploy_qwen3_tts.py` for the `serve_ap_south` function. The AP-South
+function uses Stage 1 `max_num_seqs=32`; the other Qwen functions retain Stage 1
+`max_num_seqs=8`. The Modal Server comparison remains at Stage 1
+`max_num_seqs=12`.
 
 ## Collection configuration
 
@@ -17,6 +18,9 @@ one-second observability tasks.
 | vLLM CUDA-graph metrics | Enabled |
 | vLLM model-FLOPs-utilization metrics | Enabled |
 | Qwen Code2Wav CUDA-graph statistics | Enabled |
+| Stage 0 `max_num_seqs` | 64 |
+| Stage 1 `max_num_seqs` | 32 |
+| Stage 0 KV-cache dtype | FP8 e4m3 |
 
 The vLLM server is started with `--kv-cache-metrics`,
 `--kv-cache-metrics-sample 0.01`, `--cudagraph-metrics`, and
@@ -162,7 +166,21 @@ Emitted for request phases: `handler_entry`, `request_body_received`,
 `error`.
 
 The request-body event records only input character and UTF-8 byte counts; it
-does not log the text. The completion event adds:
+does not log the text. It also separates the work immediately before the body
+is available:
+
+| Field | Unit/meaning |
+|---|---|
+| `handler_entry_log_serialize_ms` | JSON serialization time for the preceding `handler_entry` event |
+| `handler_entry_log_write_ms` | Blocking stdout `print(..., flush=True)` time for the preceding event |
+| `handler_entry_log_total_ms` | Serialization plus blocking stdout-write time |
+| `request_body_read_ms` | Time spent awaiting and decoding `request.json()` after the entry log completed |
+
+These fields distinguish synchronous logging delay from request-body delivery
+and parsing. They intentionally measure the current synchronous path before it
+is moved to a background queue.
+
+The completion event adds:
 
 | Field | Unit/meaning |
 |---|---|
@@ -180,6 +198,47 @@ does not log the text. The completion event adds:
 
 Trace, attempt, bot and turn identifiers remain available for joining these
 events without placing high-cardinality identifiers on Prometheus metrics.
+
+### Persistent WebSocket transport
+
+`/v1/audio/speech/ws` keeps one Modal Function input open per client connection.
+Each connection accepts sequential `synthesize` messages and returns `accepted`
+and `ready` JSON events, binary 8 kHz mono PCM16 messages, then a `complete`
+event. The POST route remains available as the A/B control.
+
+The client and server records expose the requested latency chain:
+
+| Field | Unit/meaning |
+|---|---|
+| `websocket_send_ms` | Client time spent writing the synthesis control message |
+| `client_send_to_websocket_receive_ms` | Client send start to Modal handler message receive; requires synchronized host clocks |
+| `client_send_complete_to_websocket_receive_ms` | Client send completion to Modal handler message receive; requires synchronized host clocks |
+| `websocket_receive_to_vllm_send_ms` | Modal WebSocket message receive to local vLLM request send |
+| `vllm_send_to_first_pcm_ms` | Local vLLM request send to first PCM message received by the client; requires synchronized host clocks |
+| `client_send_to_first_pcm_ms` | Monotonic client measurement from message send start to first PCM |
+| `websocket_connection_id` | Server-generated connection identity used to prove reuse |
+| `websocket_request_on_connection` | One-based synthesis sequence number on that connection |
+| `websocket_connection_age_at_send_ms` | Client-observed socket age when the turn is sent |
+
+Run `websocket_soak.py` for longer than 150 seconds. It verifies a final ping,
+one stable connection ID, monotonically increasing request indexes, and an
+observed connection lifetime above 150 seconds.
+
+### Modal Server comparison target
+
+`QwenTTSModalServer` exposes the same FastAPI application through Modal's
+low-latency Server primitive. Its placement deliberately matches the Web
+Function deployment without pinning GPU compute to Mumbai:
+
+```python
+compute_region="ap"
+routing_region="ap-south"
+```
+
+It retains one L40S, `target_concurrency=128`, Stage 0 `max_num_seqs=64` with
+FP8 e4m3 KV cache, Stage 1 `max_num_seqs=12`, zero minimum containers, one
+maximum container, and a 300-second scale-down window. Run the POST benchmark
+against the Server URL after the POST-versus-WebSocket Web Function comparison.
 
 ## CUDA-graph utilization
 

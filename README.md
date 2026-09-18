@@ -4,7 +4,7 @@ The bot runs locally. Each virtual call is one Pipecat pipeline containing only 
 
 ## Modal endpoint contract
 
-The bot uses an OpenAI-compatible speech endpoint:
+The default transport uses an OpenAI-compatible speech endpoint:
 
 ```http
 POST /v1/audio/speech
@@ -19,6 +19,13 @@ Content-Type: application/json
 ```
 
 The response must contain streamed raw mono signed 16-bit little-endian PCM. The Qwen endpoint returns `X-Audio-Sample-Rate: 8000`, so the bot records it directly at 8 kHz without a second resampling pass. `TTS_SOURCE_SAMPLE_RATE` is only the fallback when an endpoint omits that header. Configure the checkpoint, speaker, and language with `TTS_API_MODEL`, `TTS_VOICE`, and `TTS_LANGUAGE`.
+
+For Qwen transport A/B tests, set `TTS_TRANSPORT=websocket` or pass
+`--tts-transport websocket`. The client derives `/v1/audio/speech/ws` from the
+configured POST URL and keeps one WebSocket open for each simulated call. Every
+turn sends one JSON control message, receives `accepted` and `ready` control
+messages, streams binary 8 kHz PCM16 messages, and ends with `complete`. The
+existing POST endpoint remains unchanged and is the control.
 
 ## Configure
 
@@ -53,6 +60,26 @@ uv run python load_test.py --model qwen3-tts-1.7b --concurrency 16 --duration-se
 uv run python load_test.py --model qwen3-tts-1.7b --concurrency 96 --duration-seconds 3600 --call-duration-seconds 300 --ramp-seconds 60
 ```
 
+Run the same phase over persistent WebSockets by adding:
+
+```bash
+uv run python load_test.py \
+  --model qwen3-tts-1.7b \
+  --tts-transport websocket \
+  --concurrency 32 \
+  --duration-seconds 300 \
+  --call-duration-seconds 150 \
+  --ramp-seconds 60 \
+  --output-dir artifacts_qwen_websocket
+```
+
+Repeat with `--concurrency 48` and `--concurrency 64`. To prove that one socket
+survives beyond the ordinary 150-second HTTP boundary, run:
+
+```bash
+uv run python websocket_soak.py --duration-seconds 180 --interval-seconds 20
+```
+
 Every call rotates through all scenarios. Calls use different round-robin starting scenarios so
 concurrent calls do not send the same prompt sequence together. `--ramp-seconds` evenly staggers
 call starts across that window. By default, every call runs for the full requested duration. When
@@ -71,7 +98,7 @@ artifacts/<timestamp>_<model>_c<concurrency>_<duration>s[_call<call-duration>s]_
 
 Each `call_*.wav` is the continuous call timeline. Turn WAVs are not written; per-turn timing and tracing remain in the call JSON. Raw Pipecat metric events stay in each call JSON and are omitted from the aggregate summary to limit memory and summary-file growth.
 
-`summary.json` contains request/call counts and min/mean/p50/p95/p99/p99.9/max distributions for end-to-end TTFA, LLM latency, TTS TTFA, request time, RTF, audio-chunk inter-arrival time, playback underrun gaps, and call duration. It also separates retried and non-retried requests, counts latency breaches, classifies failures, evaluates configured thresholds, samples process RSS and event-loop lag, and verifies that TTS HTTP sessions/connectors were closed. `inter_audio_ms` is chunk-to-chunk arrival time; `playback_gap_ms` is audible buffer-underrun time.
+`summary.json` contains request/call counts and min/mean/p50/p95/p99/p99.9/max distributions for end-to-end TTFA, LLM latency, TTS TTFA, request time, RTF, audio-chunk inter-arrival time, playback underrun gaps, and call duration. WebSocket runs additionally report send time, client send to server receive, server receive to local vLLM send, local vLLM send to first client PCM, and socket age at each request. It also separates retried and non-retried requests, counts latency breaches, classifies failures, evaluates configured thresholds, samples process RSS and event-loop lag, and verifies that TTS sessions/connectors were closed. `inter_audio_ms` is chunk-to-chunk arrival time; `playback_gap_ms` is audible buffer-underrun time.
 
 Every TTS request keeps one parent `trace_id`. Each network attempt has a separate `attempt_id` and records its first, second and last body chunk plus its maximum body-chunk gap. The Modal wrapper echoes both identifiers so retries can be joined without conflating duplicate inference attempts.
 

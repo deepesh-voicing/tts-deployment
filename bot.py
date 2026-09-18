@@ -126,6 +126,7 @@ class BotConfig:
     tts_voice: str | None = None
     tts_language: str | None = None
     tts_api_model: str | None = None
+    tts_transport: str = "http"
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,12 @@ class TTSAttempt:
     ended_wall_ns: int | None = None
     modal_attempt_id: str | None = None
     modal_attempt_number: str | None = None
+    websocket_send_started_at: float | None = None
+    websocket_send_started_wall_ns: int | None = None
+    websocket_send_completed_at: float | None = None
+    websocket_send_completed_wall_ns: int | None = None
+    modal_websocket_receive_wall_ns: int | None = None
+    modal_vllm_request_sent_wall_ns: int | None = None
     error: str | None = None
 
 
@@ -184,6 +191,7 @@ class TTSRequest:
     sample_rate: int
     started_at: float
     started_wall_ns: int
+    transport: str = "http"
     connection_queued_started_at: float | None = None
     connection_pool_wait_seconds: float = 0.0
     connection_create_started_at: float | None = None
@@ -218,6 +226,14 @@ class TTSRequest:
     modal_request_body_received_wall_ns: int | None = None
     modal_upstream_request_built_wall_ns: int | None = None
     modal_vllm_request_sent_wall_ns: int | None = None
+    websocket_send_started_at: float | None = None
+    websocket_send_started_wall_ns: int | None = None
+    websocket_send_completed_at: float | None = None
+    websocket_send_completed_wall_ns: int | None = None
+    modal_websocket_receive_wall_ns: int | None = None
+    websocket_connection_id: str | None = None
+    websocket_request_on_connection: int | None = None
+    websocket_connection_age_at_send_seconds: float | None = None
     attempts: list[TTSAttempt] = field(default_factory=list)
     timeline_logged: bool = False
 
@@ -270,7 +286,7 @@ class CallState:
         self.turn_done.clear()
         return turn
 
-    def begin_tts_request(self, text: str) -> TTSRequest:
+    def begin_tts_request(self, text: str, *, transport: str = "http") -> TTSRequest:
         if self.current_turn is None:
             raise RuntimeError("TTS request arrived outside a scenario turn")
         request = TTSRequest(
@@ -281,6 +297,7 @@ class CallState:
             sample_rate=self.sample_rate,
             started_at=time.perf_counter(),
             started_wall_ns=time.time_ns(),
+            transport=transport,
         )
         self.current_turn.tts_requests.append(request)
         return request
@@ -418,6 +435,10 @@ class ModalTTSService(TTSService):
         self._timeout = aiohttp.ClientTimeout(total=config.tts_timeout_seconds)
         self._state = state
         self._session: aiohttp.ClientSession | None = None
+        self._websocket: aiohttp.ClientWebSocketResponse | None = None
+        self._websocket_lock = asyncio.Lock()
+        self._websocket_opened_at: float | None = None
+        self._websocket_opened_wall_ns: int | None = None
         self._prewarm_task: asyncio.Task[None] | None = None
 
     def can_generate_metrics(self) -> bool:
@@ -451,6 +472,9 @@ class ModalTTSService(TTSService):
     async def _replace_session(self) -> None:
         session = self._session
         self._session = None
+        self._websocket = None
+        self._websocket_opened_at = None
+        self._websocket_opened_wall_ns = None
         await _close_tracked_tts_session(session)
         self._session = self._create_session()
 
@@ -472,6 +496,12 @@ class ModalTTSService(TTSService):
                 self._prewarm_task.cancel()
             await asyncio.gather(self._prewarm_task, return_exceptions=True)
             self._prewarm_task = None
+        websocket = self._websocket
+        self._websocket = None
+        self._websocket_opened_at = None
+        self._websocket_opened_wall_ns = None
+        if websocket is not None and not websocket.closed:
+            await websocket.close()
         session = self._session
         self._session = None
         await _close_tracked_tts_session(session)
@@ -481,6 +511,9 @@ class ModalTTSService(TTSService):
             return
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
         try:
+            if self._config.tts_transport == "websocket":
+                await self._ensure_websocket()
+                return
             async with self._session.get(
                 self._url,
                 headers=headers,
@@ -496,6 +529,52 @@ class ModalTTSService(TTSService):
         task = self._prewarm_task
         self._prewarm_task = None
         await task
+
+    @staticmethod
+    def _websocket_url(url: str) -> str:
+        if url.startswith("https://"):
+            url = "wss://" + url.removeprefix("https://")
+        elif url.startswith("http://"):
+            url = "ws://" + url.removeprefix("http://")
+        elif not url.startswith(("ws://", "wss://")):
+            raise ValueError("WebSocket TTS URL must use http(s) or ws(s)")
+        return url if url.rstrip("/").endswith("/ws") else f"{url.rstrip('/')}/ws"
+
+    async def _ensure_websocket(self) -> bool:
+        """Return True when an already-open socket is reused."""
+        if self._websocket is not None and not self._websocket.closed:
+            return True
+        if self._session is None:
+            raise RuntimeError("TTS HTTP session was not started")
+        headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
+        self._websocket = await self._session.ws_connect(
+            self._websocket_url(self._url),
+            headers=headers,
+            heartbeat=30.0,
+            autoping=True,
+        )
+        self._websocket_opened_at = time.perf_counter()
+        self._websocket_opened_wall_ns = time.time_ns()
+        return False
+
+    def _tts_payload(self, text: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "input": text,
+            "response_format": "pcm",
+            "stream": True,
+            "stream_format": "audio",
+        }
+        if self._config.tts_ref_audio:
+            payload["ref_audio"] = self._config.tts_ref_audio
+        if self._config.tts_ref_text:
+            payload["ref_text"] = self._config.tts_ref_text
+        if self._config.tts_voice:
+            payload["voice"] = self._config.tts_voice
+        if self._config.tts_language:
+            payload["language"] = self._config.tts_language
+        if self._config.tts_api_model:
+            payload["model"] = self._config.tts_api_model
+        return payload
 
     @staticmethod
     def _request_from_trace_context(trace_config_ctx: Any) -> TTSRequest | None:
@@ -633,9 +712,269 @@ class ModalTTSService(TTSService):
                 attempt.connection_ready_at = now
                 attempt.connection_ready_wall_ns = wall_ns
 
-    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
+    @staticmethod
+    def _record_websocket_send_start(
+        request: TTSRequest,
+        attempt: TTSAttempt,
+    ) -> None:
+        now = time.perf_counter()
+        wall_ns = time.time_ns()
+        for target in (request, attempt):
+            target.websocket_send_started_at = now
+            target.websocket_send_started_wall_ns = wall_ns
+            target.request_headers_sent_at = now
+            target.request_headers_sent_wall_ns = wall_ns
+
+    @staticmethod
+    def _record_websocket_send_complete(
+        request: TTSRequest,
+        attempt: TTSAttempt,
+    ) -> None:
+        now = time.perf_counter()
+        wall_ns = time.time_ns()
+        for target in (request, attempt):
+            target.websocket_send_completed_at = now
+            target.websocket_send_completed_wall_ns = wall_ns
+
+    @staticmethod
+    def _record_websocket_control(
+        request: TTSRequest,
+        attempt: TTSAttempt,
+        event: dict[str, Any],
+    ) -> None:
+        trace_id = event.get("trace_id")
+        attempt_id = event.get("attempt_id")
+        if trace_id and trace_id != request.trace_id:
+            raise RuntimeError(
+                f"WebSocket trace mismatch: client={request.trace_id} server={trace_id}"
+            )
+        if attempt_id and attempt_id != attempt.attempt_id:
+            raise RuntimeError(
+                f"WebSocket attempt mismatch: client={attempt.attempt_id} server={attempt_id}"
+            )
+
+        if event.get("type") == "accepted":
+            receive_wall_ns = _optional_int_header(
+                str(event.get("websocket_receive_wall_ns"))
+                if event.get("websocket_receive_wall_ns") is not None
+                else None
+            )
+            request.modal_trace_id = trace_id
+            request.modal_handler_entry_wall_ns = receive_wall_ns
+            request.modal_websocket_receive_wall_ns = receive_wall_ns
+            request.websocket_connection_id = event.get("connection_id")
+            request.websocket_request_on_connection = event.get(
+                "request_on_connection"
+            )
+            attempt.modal_attempt_id = attempt_id
+            attempt.modal_websocket_receive_wall_ns = receive_wall_ns
+        elif event.get("type") == "ready":
+            now = time.perf_counter()
+            wall_ns = time.time_ns()
+            for target in (request, attempt):
+                target.response_headers_at = now
+                target.response_headers_wall_ns = wall_ns
+            request.modal_upstream_request_built_wall_ns = _optional_int_header(
+                str(event.get("upstream_request_built_wall_ns"))
+                if event.get("upstream_request_built_wall_ns") is not None
+                else None
+            )
+            vllm_sent_wall_ns = _optional_int_header(
+                str(event.get("vllm_request_sent_wall_ns"))
+                if event.get("vllm_request_sent_wall_ns") is not None
+                else None
+            )
+            request.modal_vllm_request_sent_wall_ns = vllm_sent_wall_ns
+            attempt.modal_vllm_request_sent_wall_ns = vllm_sent_wall_ns
+
+    async def _run_tts_websocket(
+        self,
+        text: str,
+        context_id: str,
+    ) -> AsyncGenerator[Frame | None, None]:
         await self._await_prewarm()
-        request = self._state.begin_tts_request(text)
+        request = self._state.begin_tts_request(text, transport="websocket")
+        payload = self._tts_payload(text)
+
+        try:
+            async with self._websocket_lock:
+                for _ in range(2):
+                    attempt = self._start_attempt(request)
+                    try:
+                        connection_started_at = time.perf_counter()
+                        connection_reused = await self._ensure_websocket()
+                        connection_ready_at = time.perf_counter()
+                        connection_ready_wall_ns = time.time_ns()
+                        for target in (request, attempt):
+                            target.connection_reused = connection_reused
+                            target.connection_ready_at = connection_ready_at
+                            target.connection_ready_wall_ns = connection_ready_wall_ns
+                            if not connection_reused:
+                                target.connection_create_seconds += (
+                                    connection_ready_at - connection_started_at
+                                )
+                        if self._websocket_opened_at is not None:
+                            request.websocket_connection_age_at_send_seconds = max(
+                                0.0,
+                                time.perf_counter() - self._websocket_opened_at,
+                            )
+                        websocket = self._websocket
+                        if websocket is None:
+                            raise RuntimeError("TTS WebSocket was not opened")
+
+                        self._record_websocket_send_start(request, attempt)
+                        await websocket.send_json(
+                            {
+                                "type": "synthesize",
+                                "trace_id": request.trace_id,
+                                "attempt_id": attempt.attempt_id,
+                                "attempt_number": attempt.number,
+                                "bot_number": request.bot_number,
+                                "turn_number": request.turn_number,
+                                "client_send_started_wall_ns": (
+                                    attempt.websocket_send_started_wall_ns
+                                ),
+                                "payload": payload,
+                            }
+                        )
+                        self._record_websocket_send_complete(request, attempt)
+
+                        usage_started = False
+                        ready_seen = False
+
+                        async def pcm_chunks(
+                            websocket: aiohttp.ClientWebSocketResponse = websocket,
+                            attempt: TTSAttempt = attempt,
+                        ) -> AsyncGenerator[bytes, None]:
+                            nonlocal ready_seen, usage_started
+                            while True:
+                                receive_timeout = (
+                                    min(
+                                        TTS_RESPONSE_HEADER_TIMEOUT_SECONDS,
+                                        self._config.tts_timeout_seconds,
+                                    )
+                                    if not ready_seen
+                                    else self._config.tts_timeout_seconds
+                                )
+                                message = await asyncio.wait_for(
+                                    websocket.receive(),
+                                    timeout=receive_timeout,
+                                )
+                                if message.type == aiohttp.WSMsgType.BINARY:
+                                    if not ready_seen:
+                                        raise RuntimeError(
+                                            "WebSocket audio arrived before ready metadata"
+                                        )
+                                    chunk = bytes(message.data)
+                                    if not chunk:
+                                        continue
+                                    self._state.received_tts_body(
+                                        request,
+                                        attempt,
+                                        len(chunk),
+                                    )
+                                    await self.stop_ttfb_metrics()
+                                    yield chunk
+                                    continue
+                                if message.type == aiohttp.WSMsgType.TEXT:
+                                    event = json.loads(message.data)
+                                    self._record_websocket_control(
+                                        request,
+                                        attempt,
+                                        event,
+                                    )
+                                    event_type = event.get("type")
+                                    if event_type == "accepted":
+                                        continue
+                                    if event_type == "ready":
+                                        status_code = int(event.get("status_code", 500))
+                                        if status_code != 200:
+                                            attempt.error = f"http_{status_code}"
+                                            continue
+                                        ready_seen = True
+                                        if not usage_started:
+                                            await self.start_tts_usage_metrics(text)
+                                            usage_started = True
+                                        continue
+                                    if event_type == "complete":
+                                        if not ready_seen:
+                                            raise RuntimeError(
+                                                "WebSocket completed before ready metadata"
+                                            )
+                                        return
+                                    if event_type == "error":
+                                        error = str(event.get("error") or "websocket_error")
+                                        detail = str(event.get("detail") or "")[:500]
+                                        raise RuntimeError(f"{error}: {detail}")
+                                    if event_type == "pong":
+                                        continue
+                                    raise RuntimeError(
+                                        f"Unsupported WebSocket response: {event_type!r}"
+                                    )
+                                if message.type in {
+                                    aiohttp.WSMsgType.CLOSE,
+                                    aiohttp.WSMsgType.CLOSED,
+                                    aiohttp.WSMsgType.CLOSING,
+                                }:
+                                    raise aiohttp.ClientConnectionError(
+                                        "TTS WebSocket closed during synthesis"
+                                    )
+                                if message.type == aiohttp.WSMsgType.ERROR:
+                                    raise aiohttp.ClientConnectionError(
+                                        f"TTS WebSocket error: {websocket.exception()}"
+                                    )
+
+                        async for frame in self._stream_audio_frames_from_iterator(
+                            pcm_chunks(),
+                            in_sample_rate=self._config.tts_source_sample_rate,
+                            context_id=context_id,
+                        ):
+                            yield frame
+                        break
+                    except Exception as exc:
+                        no_response = (
+                            attempt.response_headers_at is None
+                            and attempt.first_body_at is None
+                        )
+                        retryable = no_response and isinstance(
+                            exc,
+                            (TimeoutError, aiohttp.ClientConnectionError),
+                        )
+                        if isinstance(exc, TimeoutError) and no_response:
+                            attempt.error = "response_headers_timeout"
+                        else:
+                            attempt.error = f"{type(exc).__name__}: {exc}"
+
+                        if attempt.number == 1 and retryable:
+                            logger.warning(
+                                "TTS WebSocket attempt failed before ready; retrying once "
+                                "on a fresh connection: trace_id={} bot={} turn={} error={}",
+                                request.trace_id,
+                                request.bot_number,
+                                request.turn_number,
+                                attempt.error,
+                            )
+                            await self._replace_session()
+                            continue
+                        raise
+                    finally:
+                        attempt.ended_at = time.perf_counter()
+                        attempt.ended_wall_ns = time.time_ns()
+        except Exception as exc:  # noqa: BLE001 - convert provider failures to pipeline errors
+            yield ErrorFrame(error=f"TTS request failed: {exc}", exception=exc)
+        finally:
+            request.ended_at = time.perf_counter()
+            request.ended_wall_ns = time.time_ns()
+            await self.stop_ttfb_metrics()
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
+        if self._config.tts_transport == "websocket":
+            async for frame in self._run_tts_websocket(text, context_id):
+                yield frame
+            return
+
+        await self._await_prewarm()
+        request = self._state.begin_tts_request(text, transport="http")
         base_headers = {
             "Content-Type": "application/json",
             "X-Trace-Id": request.trace_id,
@@ -644,22 +983,7 @@ class ModalTTSService(TTSService):
         }
         if self._token:
             base_headers["Authorization"] = f"Bearer {self._token}"
-        payload = {
-            "input": text,
-            "response_format": "pcm",
-            "stream": True,
-            "stream_format": "audio",
-        }
-        if self._config.tts_ref_audio:
-            payload["ref_audio"] = self._config.tts_ref_audio
-        if self._config.tts_ref_text:
-            payload["ref_text"] = self._config.tts_ref_text
-        if self._config.tts_voice:
-            payload["voice"] = self._config.tts_voice
-        if self._config.tts_language:
-            payload["language"] = self._config.tts_language
-        if self._config.tts_api_model:
-            payload["model"] = self._config.tts_api_model
+        payload = self._tts_payload(text)
 
         try:
             for _ in range(2):
@@ -936,6 +1260,12 @@ def _elapsed_ms(start: float, end: float | None) -> float | None:
     return round((end - start) * 1000, 3) if end is not None else None
 
 
+def _wall_elapsed_ms(start_ns: int | None, end_ns: int | None) -> float | None:
+    if start_ns is None or end_ns is None:
+        return None
+    return round((end_ns - start_ns) / 1_000_000, 3)
+
+
 def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
     return {
         "attempt_id": attempt.attempt_id,
@@ -967,6 +1297,30 @@ def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
         "body_chunk_count": attempt.body_chunk_count,
         "body_bytes": attempt.body_bytes,
         "attempt_ms": _elapsed_ms(attempt.started_at, attempt.ended_at),
+        "websocket_send_ms": (
+            _elapsed_ms(
+                attempt.websocket_send_started_at,
+                attempt.websocket_send_completed_at,
+            )
+            if attempt.websocket_send_started_at is not None
+            else None
+        ),
+        "client_send_to_websocket_receive_ms": _wall_elapsed_ms(
+            attempt.websocket_send_started_wall_ns,
+            attempt.modal_websocket_receive_wall_ns,
+        ),
+        "client_send_complete_to_websocket_receive_ms": _wall_elapsed_ms(
+            attempt.websocket_send_completed_wall_ns,
+            attempt.modal_websocket_receive_wall_ns,
+        ),
+        "websocket_receive_to_vllm_send_ms": _wall_elapsed_ms(
+            attempt.modal_websocket_receive_wall_ns,
+            attempt.modal_vllm_request_sent_wall_ns,
+        ),
+        "vllm_send_to_first_pcm_ms": _wall_elapsed_ms(
+            attempt.modal_vllm_request_sent_wall_ns,
+            attempt.first_body_wall_ns,
+        ),
         "error": attempt.error,
         "client_wall_time_ns": {
             "attempt_start": attempt.started_wall_ns,
@@ -977,6 +1331,12 @@ def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
             "second_body": attempt.second_body_wall_ns,
             "last_body": attempt.last_body_wall_ns,
             "attempt_end": attempt.ended_wall_ns,
+            "websocket_send_started": attempt.websocket_send_started_wall_ns,
+            "websocket_send_completed": attempt.websocket_send_completed_wall_ns,
+        },
+        "modal_wall_time_ns": {
+            "websocket_receive": attempt.modal_websocket_receive_wall_ns,
+            "vllm_request_sent": attempt.modal_vllm_request_sent_wall_ns,
         },
     }
 
@@ -988,6 +1348,7 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
     audio_duration_ms = request.audio_bytes / (request.sample_rate * 2) * 1000
     return {
         "trace_id": request.trace_id,
+        "transport": request.transport,
         "bot_number": request.bot_number,
         "turn_number": request.turn_number,
         "modal_trace_id": request.modal_trace_id,
@@ -1017,6 +1378,42 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
         ),
         "body_chunk_count": request.body_chunk_count,
         "body_bytes": request.body_bytes,
+        "websocket_send_ms": (
+            _elapsed_ms(
+                request.websocket_send_started_at,
+                request.websocket_send_completed_at,
+            )
+            if request.websocket_send_started_at is not None
+            else None
+        ),
+        "client_send_to_websocket_receive_ms": _wall_elapsed_ms(
+            request.websocket_send_started_wall_ns,
+            request.modal_websocket_receive_wall_ns,
+        ),
+        "client_send_complete_to_websocket_receive_ms": _wall_elapsed_ms(
+            request.websocket_send_completed_wall_ns,
+            request.modal_websocket_receive_wall_ns,
+        ),
+        "websocket_receive_to_vllm_send_ms": _wall_elapsed_ms(
+            request.modal_websocket_receive_wall_ns,
+            request.modal_vllm_request_sent_wall_ns,
+        ),
+        "vllm_send_to_first_pcm_ms": _wall_elapsed_ms(
+            request.modal_vllm_request_sent_wall_ns,
+            request.first_body_wall_ns,
+        ),
+        "client_send_to_first_pcm_ms": (
+            _elapsed_ms(request.websocket_send_started_at, request.first_body_at)
+            if request.websocket_send_started_at is not None
+            else None
+        ),
+        "websocket_connection_id": request.websocket_connection_id,
+        "websocket_request_on_connection": request.websocket_request_on_connection,
+        "websocket_connection_age_at_send_ms": (
+            round(request.websocket_connection_age_at_send_seconds * 1000, 3)
+            if request.websocket_connection_age_at_send_seconds is not None
+            else None
+        ),
         "first_playable_ttfa_ms": first_playable_ttfa_ms,
         "playable_gate_ms": (
             round((request.first_playable_at - request.first_body_at) * 1000, 3)
@@ -1044,12 +1441,15 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
             "last_body": request.last_body_wall_ns,
             "first_playable": request.first_playable_wall_ns,
             "request_end": request.ended_wall_ns,
+            "websocket_send_started": request.websocket_send_started_wall_ns,
+            "websocket_send_completed": request.websocket_send_completed_wall_ns,
         },
         "modal_wall_time_ns": {
             "handler_entry": request.modal_handler_entry_wall_ns,
             "request_body_received": request.modal_request_body_received_wall_ns,
             "upstream_request_built": request.modal_upstream_request_built_wall_ns,
             "vllm_request_sent": request.modal_vllm_request_sent_wall_ns,
+            "websocket_receive": request.modal_websocket_receive_wall_ns,
         },
     }
 
@@ -1144,6 +1544,41 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
             request["request_ms"]
             for request in request_reports
             if request["request_ms"] is not None
+        ],
+        "websocket_send_ms": [
+            request["websocket_send_ms"]
+            for request in request_reports
+            if request["websocket_send_ms"] is not None
+        ],
+        "client_send_to_websocket_receive_ms": [
+            request["client_send_to_websocket_receive_ms"]
+            for request in request_reports
+            if request["client_send_to_websocket_receive_ms"] is not None
+        ],
+        "client_send_complete_to_websocket_receive_ms": [
+            request["client_send_complete_to_websocket_receive_ms"]
+            for request in request_reports
+            if request["client_send_complete_to_websocket_receive_ms"] is not None
+        ],
+        "websocket_receive_to_vllm_send_ms": [
+            request["websocket_receive_to_vllm_send_ms"]
+            for request in request_reports
+            if request["websocket_receive_to_vllm_send_ms"] is not None
+        ],
+        "vllm_send_to_first_pcm_ms": [
+            request["vllm_send_to_first_pcm_ms"]
+            for request in request_reports
+            if request["vllm_send_to_first_pcm_ms"] is not None
+        ],
+        "client_send_to_first_pcm_ms": [
+            request["client_send_to_first_pcm_ms"]
+            for request in request_reports
+            if request["client_send_to_first_pcm_ms"] is not None
+        ],
+        "websocket_connection_age_at_send_ms": [
+            request["websocket_connection_age_at_send_ms"]
+            for request in request_reports
+            if request["websocket_connection_age_at_send_ms"] is not None
         ],
         "inter_audio_ms": _milliseconds(turn.inter_audio_seconds),
         "playback_gap_ms": _milliseconds(turn.playback_gap_seconds),
@@ -1284,6 +1719,35 @@ async def run_call(
         "tts_ttfa_ms": [value for turn in turns for value in turn["tts_ttfa_ms"]],
         "playable_gate_ms": [value for turn in turns for value in turn["playable_gate_ms"]],
         "tts_request_ms": [value for turn in turns for value in turn["tts_request_ms"]],
+        "websocket_send_ms": [
+            value for turn in turns for value in turn["websocket_send_ms"]
+        ],
+        "client_send_to_websocket_receive_ms": [
+            value
+            for turn in turns
+            for value in turn["client_send_to_websocket_receive_ms"]
+        ],
+        "client_send_complete_to_websocket_receive_ms": [
+            value
+            for turn in turns
+            for value in turn["client_send_complete_to_websocket_receive_ms"]
+        ],
+        "websocket_receive_to_vllm_send_ms": [
+            value
+            for turn in turns
+            for value in turn["websocket_receive_to_vllm_send_ms"]
+        ],
+        "vllm_send_to_first_pcm_ms": [
+            value for turn in turns for value in turn["vllm_send_to_first_pcm_ms"]
+        ],
+        "client_send_to_first_pcm_ms": [
+            value for turn in turns for value in turn["client_send_to_first_pcm_ms"]
+        ],
+        "websocket_connection_age_at_send_ms": [
+            value
+            for turn in turns
+            for value in turn["websocket_connection_age_at_send_ms"]
+        ],
         "inter_audio_ms": [value for turn in turns for value in turn["inter_audio_ms"]],
         "playback_gap_ms": [value for turn in turns for value in turn["playback_gap_ms"]],
         "rtf": [value for turn in turns for value in turn["rtf"]],
@@ -1538,6 +2002,13 @@ def build_load_report(
         "playable_gate_ms",
         "pipecat_tts_ttfa_ms",
         "tts_request_ms",
+        "websocket_send_ms",
+        "client_send_to_websocket_receive_ms",
+        "client_send_complete_to_websocket_receive_ms",
+        "websocket_receive_to_vllm_send_ms",
+        "vllm_send_to_first_pcm_ms",
+        "client_send_to_first_pcm_ms",
+        "websocket_connection_age_at_send_ms",
         "tts_processing_ms",
         "inter_audio_ms",
         "playback_gap_ms",
@@ -1622,6 +2093,7 @@ def build_load_report(
         "created_at": datetime.now(UTC).isoformat(),
         "model": config.model,
         "tts_url": config.tts_url,
+        "tts_transport": config.tts_transport,
         "sample_rate": config.sample_rate,
         "tts_source_sample_rate": config.tts_source_sample_rate,
         "llm_model": config.llm_model,
@@ -1728,6 +2200,12 @@ def _slug(value: str) -> str:
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", required=True, choices=MODEL_NAMES)
     parser.add_argument("--tts-url", default=os.getenv("TTS_URL"))
+    parser.add_argument(
+        "--tts-transport",
+        choices=("http", "websocket"),
+        default=os.getenv("TTS_TRANSPORT", "http"),
+        help="Use one POST per turn or one persistent WebSocket per call",
+    )
     parser.add_argument("--tts-bearer-token", default=os.getenv("TTS_BEARER_TOKEN"))
     parser.add_argument("--tts-ref-audio", default=os.getenv("TTS_REF_AUDIO"))
     parser.add_argument("--tts-ref-text", default=os.getenv("TTS_REF_TEXT"))
@@ -1793,6 +2271,7 @@ def config_from_args(args: argparse.Namespace) -> BotConfig:
     return BotConfig(
         model=args.model,
         tts_url=args.tts_url,
+        tts_transport=args.tts_transport,
         tts_bearer_token=args.tts_bearer_token,
         sample_rate=args.sample_rate,
         tts_source_sample_rate=args.tts_source_sample_rate,

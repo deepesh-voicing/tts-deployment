@@ -28,10 +28,14 @@ class _Image:
 
 class _App:
     def __init__(self, *_args, **_kwargs):
-        pass
+        self.server_options = []
 
     def function(self, *_args, **_kwargs):
         return lambda function: function
+
+    def server(self, *_args, **kwargs):
+        self.server_options.append(kwargs)
+        return lambda server_class: server_class
 
 
 def _decorator(*_args, **_kwargs):
@@ -47,6 +51,8 @@ def qwen_module():
         Volume=_Resource,
         asgi_app=_decorator,
         concurrent=_decorator,
+        enter=_decorator,
+        exit=_decorator,
     )
     previous_modal = sys.modules.get("modal")
     sys.modules["modal"] = fake_modal
@@ -111,6 +117,51 @@ vllm_omni:num_requests_running{model_name="qwen"} 6
         "p95_upper_bound": 64.0,
         "p99_upper_bound": 64.0,
         "mean": 24.0,
+    }
+
+
+def test_ap_south_increases_only_stage_1_capacity(qwen_module):
+    default_overrides = qwen_module.json.loads(qwen_module.DEFAULT_STAGE_OVERRIDES)
+    ap_overrides = qwen_module.json.loads(qwen_module.AP_STAGE_OVERRIDES)
+    ap_south_overrides = qwen_module.json.loads(qwen_module.AP_SOUTH_STAGE_OVERRIDES)
+
+    assert default_overrides["1"]["max_num_seqs"] == 8
+    assert ap_overrides["1"]["max_num_seqs"] == 8
+    assert ap_south_overrides == {
+        "0": {"max_num_seqs": 64, "kv_cache_dtype": "fp8_e4m3"},
+        "1": {"max_num_seqs": 32},
+    }
+
+    modal_server_overrides = qwen_module.json.loads(
+        qwen_module.MODAL_SERVER_STAGE_OVERRIDES
+    )
+    assert modal_server_overrides == {
+        "0": {"max_num_seqs": 64, "kv_cache_dtype": "fp8_e4m3"},
+        "1": {"max_num_seqs": 12},
+    }
+
+
+def test_modal_server_keeps_broad_ap_compute_with_mumbai_ingress(qwen_module):
+    [options] = qwen_module.app.server_options
+
+    assert options["compute_region"] == "ap"
+    assert options["routing_region"] == "ap-south"
+    assert options["target_concurrency"] == 128
+    assert options["min_containers"] == 0
+    assert options["max_containers"] == 1
+
+
+def test_log_timing_summary_separates_serialization_and_write(qwen_module):
+    timing = qwen_module._log_timing_summary(
+        serialize_started_ns=1_000_000_000,
+        write_started_ns=1_002_500_000,
+        completed_ns=1_135_000_000,
+    )
+
+    assert timing == {
+        "serialize_ms": 2.5,
+        "write_ms": 132.5,
+        "total_ms": 135.0,
     }
 
 

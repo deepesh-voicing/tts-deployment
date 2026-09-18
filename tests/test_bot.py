@@ -75,6 +75,7 @@ async def _run_local_pipeline(
     tmp_path: Path,
     call_count: int = 1,
     first_tts_header_delay_seconds: float = 0.0,
+    tts_transport: str = "http",
 ):
     tts_post_count = 0
 
@@ -161,9 +162,82 @@ async def _run_local_pipeline(
         await response.write_eof()
         return response
 
+    async def tts_websocket_handler(request):
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        connection_id = "local-test-connection"
+        request_on_connection = 0
+        async for message in websocket:
+            if message.type != web.WSMsgType.TEXT:
+                continue
+            event = json.loads(message.data)
+            if event.get("type") == "ping":
+                await websocket.send_json(
+                    {
+                        "type": "pong",
+                        "client_wall_time_ns": event.get("client_wall_time_ns"),
+                        "server_wall_time_ns": time.time_ns(),
+                    }
+                )
+                continue
+            assert event["type"] == "synthesize"
+            request_on_connection += 1
+            payload = event["payload"]
+            assert payload == {
+                "input": "Hello from the test. This is sentence two.",
+                "response_format": "pcm",
+                "stream": True,
+                "stream_format": "audio",
+                "voice": "Vivian",
+                "language": "English",
+                "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            }
+            receive_wall_ns = time.time_ns()
+            await websocket.send_json(
+                {
+                    "type": "accepted",
+                    "trace_id": event["trace_id"],
+                    "attempt_id": event["attempt_id"],
+                    "connection_id": connection_id,
+                    "request_on_connection": request_on_connection,
+                    "websocket_receive_wall_ns": receive_wall_ns,
+                }
+            )
+            await websocket.send_json(
+                {
+                    "type": "ready",
+                    "trace_id": event["trace_id"],
+                    "attempt_id": event["attempt_id"],
+                    "status_code": 200,
+                    "sample_rate": 8000,
+                    "sample_format": "s16le",
+                    "channels": 1,
+                    "websocket_receive_wall_ns": receive_wall_ns,
+                    "upstream_request_built_wall_ns": time.time_ns(),
+                    "vllm_request_sent_wall_ns": time.time_ns(),
+                }
+            )
+            await websocket.send_bytes(b"\x00\x00" * 2400)
+            await asyncio.sleep(0.01)
+            await websocket.send_bytes(b"\xe8\x03" * 2400)
+            await asyncio.sleep(0.01)
+            await websocket.send_bytes(b"\xe8\x03" * 2400)
+            await websocket.send_json(
+                {
+                    "type": "complete",
+                    "trace_id": event["trace_id"],
+                    "attempt_id": event["attempt_id"],
+                    "complete_wall_ns": time.time_ns(),
+                    "output_bytes": 14_400,
+                    "output_chunks": 3,
+                }
+            )
+        return websocket
+
     app = web.Application()
     app.router.add_post("/v1/chat/completions", chat_handler)
     app.router.add_post("/tts", tts_handler)
+    app.router.add_get("/tts/ws", tts_websocket_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -188,6 +262,7 @@ async def _run_local_pipeline(
         tts_voice="Vivian",
         tts_language="English",
         tts_api_model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        tts_transport=tts_transport,
     )
     scenario = Scenario(
         name="test",
@@ -325,6 +400,37 @@ def test_two_calls_run_concurrently(tmp_path):
     assert counters_after["sessions_closed"] - counters_before["sessions_closed"] == 2
     assert counters_after["connectors_closed"] - counters_before["connectors_closed"] == 2
     assert counters_after["sessions_active"] == counters_before["sessions_active"]
+
+
+def test_websocket_transport_records_four_phase_timeline(tmp_path):
+    _, results = asyncio.run(
+        _run_local_pipeline(tmp_path, tts_transport="websocket")
+    )
+
+    result = results[0]
+    timeline = result["turns"][0]["tts_requests"][0]
+    assert result["success"] is True
+    assert timeline["transport"] == "websocket"
+    assert timeline["websocket_connection_id"] == "local-test-connection"
+    assert timeline["websocket_request_on_connection"] == 1
+    assert timeline["websocket_send_ms"] is not None
+    assert timeline["client_send_to_websocket_receive_ms"] is not None
+    assert timeline["websocket_receive_to_vllm_send_ms"] is not None
+    assert timeline["vllm_send_to_first_pcm_ms"] is not None
+    assert timeline["client_send_to_first_pcm_ms"] is not None
+    assert timeline["websocket_connection_age_at_send_ms"] is not None
+    assert timeline["attempt_count"] == 1
+    assert timeline["retry_count"] == 0
+    assert timeline["body_chunk_count"] == 3
+
+
+def test_websocket_url_is_derived_from_http_endpoint():
+    assert (
+        bot_module.ModalTTSService._websocket_url(
+            "https://example.modal.run/v1/audio/speech"
+        )
+        == "wss://example.modal.run/v1/audio/speech/ws"
+    )
 
 
 def test_tts_retries_once_on_response_header_timeout(tmp_path, monkeypatch):
