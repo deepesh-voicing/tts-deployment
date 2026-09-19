@@ -191,6 +191,12 @@ def test_realtime_wire_contract_is_present():
     assert '"stream": True' in source
     assert "await websocket.send_bytes(output_chunk)" in source
     assert '"type": "segment_done"' in source
+    assert '"websocket_receive_to_vllm_send_ms"' in source
+    assert '"vllm_send_to_first_24khz_audio_ms"' in source
+    assert '"first_24khz_audio_to_first_8khz_pcm_sent_ms"' in source
+    assert '"queue_ms"' in source
+    assert '"first_audio_ms"' in source
+    assert '"generation_ms"' in source
     assert '"type": "flush_done"' in source
     assert '"context_id": context_id' in source
     assert '"type": "final"' in source

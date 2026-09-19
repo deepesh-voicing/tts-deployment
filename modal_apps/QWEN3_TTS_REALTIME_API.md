@@ -58,6 +58,21 @@ The client may then send:
 Audio is sent as binary 8 kHz mono PCM16 frames. JSON control events are
 `segment_started`, `segment_done`, `flush_done`, `pong`, `final`, and `error`.
 
+Each `segment_done` event includes the server-side timing breakdown:
+
+- `websocket_receive_to_vllm_send_ms`
+- `vllm_send_to_first_24khz_audio_ms`
+- `first_24khz_audio_to_first_8khz_pcm_sent_ms`
+- `queue_ms`
+- `first_audio_ms`
+- `generation_ms`
+
+It also includes the corresponding server wall-clock timestamps. The load-test
+client stores every segment record and combines the first segment with its own
+`client_send_to_first_pcm_ms` measurement. Server duration fields use a
+monotonic clock; cross-host client/server wall-clock comparisons still depend
+on clock synchronization.
+
 `flush_done` echoes the `context_id` after all audio for that flush has been
 sent. The connection remains open for the next utterance. Send `close` only
 when the call is ending; the server then sends `final` and closes the socket.

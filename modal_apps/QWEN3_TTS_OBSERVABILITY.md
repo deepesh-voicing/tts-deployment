@@ -224,6 +224,27 @@ Run `websocket_soak.py` for longer than 150 seconds. It verifies a final ping,
 one stable connection ID, monotonically increasing request indexes, and an
 observed connection lifetime above 150 seconds.
 
+### Realtime partial-text WebSocket timing
+
+The isolated `/v1/text-to-speech/{voice_id}/stream-input` route emits one
+`segment_done` timing record per Qwen segment. The load-test artifact retains
+every record and promotes the first segment into the request latency summary.
+
+| Field | Unit/meaning |
+|---|---|
+| `websocket_receive_to_vllm_send_ms` | Server-monotonic time from receipt of the control message that released the segment through local vLLM submission; includes segment queueing |
+| `vllm_send_to_first_24khz_audio_ms` | Local vLLM submission through receipt of its first native 24 kHz PCM chunk |
+| `first_24khz_audio_to_first_8khz_pcm_sent_ms` | First native chunk through resampling and completion of the first public 8 kHz WebSocket send |
+| `client_send_to_first_pcm_ms` | Client-monotonic send start through receipt of the first public PCM frame |
+| `queue_ms` | Segment enqueue through start of segment synthesis |
+| `first_audio_ms` | Segment synthesis start through the first resampled chunk becoming available to send |
+| `generation_ms` | Segment synthesis start through the completed upstream stream |
+
+The event also carries server wall-clock timestamps for receipt, vLLM
+submission, first 24 kHz audio, and first 8 kHz send. Use the monotonic duration
+fields for server-internal analysis; client/server wall-clock subtraction
+depends on clock synchronization.
+
 ### Modal Server comparison target
 
 `QwenTTSModalServer` exposes the same FastAPI application through Modal's

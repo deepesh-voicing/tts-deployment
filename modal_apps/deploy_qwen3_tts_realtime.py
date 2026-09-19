@@ -1730,7 +1730,13 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             async with send_lock:
                 await websocket.send_json(payload)
 
-        async def queue_segments(segments: list[str], context_id: str | None) -> None:
+        async def queue_segments(
+            segments: list[str],
+            context_id: str | None,
+            *,
+            websocket_receive_wall_ns: int,
+            websocket_receive_monotonic_ns: int,
+        ) -> None:
             nonlocal next_segment_id
             for segment in segments:
                 await segment_queue.put(
@@ -1740,6 +1746,8 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                         "text": segment,
                         "enqueued_ns": time.monotonic_ns(),
                         "context_id": context_id,
+                        "websocket_receive_wall_ns": websocket_receive_wall_ns,
+                        "websocket_receive_monotonic_ns": websocket_receive_monotonic_ns,
                     }
                 )
                 next_segment_id += 1
@@ -1761,6 +1769,9 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                     )
                     await websocket.close(code=4408, reason="Inactivity timeout")
                     raise WebSocketDisconnect(code=4408)
+
+                websocket_receive_wall_ns = time.time_ns()
+                websocket_receive_monotonic_ns = time.monotonic_ns()
 
                 if len(raw_message.encode("utf-8")) > MAX_TEXT_MESSAGE_BYTES:
                     await send_json(
@@ -1795,7 +1806,12 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                         buffered_text,
                         flush=True,
                     )
-                    await queue_segments(segments, buffered_context_id)
+                    await queue_segments(
+                        segments,
+                        buffered_context_id,
+                        websocket_receive_wall_ns=websocket_receive_wall_ns,
+                        websocket_receive_monotonic_ns=websocket_receive_monotonic_ns,
+                    )
                     if segments:
                         await segment_queue.put(
                             {
@@ -1845,7 +1861,12 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                     )
                     await websocket.close(code=4400, reason="Text buffer limit exceeded")
                     raise WebSocketDisconnect(code=4400)
-                await queue_segments(segments, buffered_context_id)
+                await queue_segments(
+                    segments,
+                    buffered_context_id,
+                    websocket_receive_wall_ns=websocket_receive_wall_ns,
+                    websocket_receive_monotonic_ns=websocket_receive_monotonic_ns,
+                )
                 if message.get("flush") is True:
                     await segment_queue.put(
                         {
@@ -1860,10 +1881,11 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             text: str,
             enqueued_ns: int,
             context_id: str | None,
+            websocket_receive_wall_ns: int,
+            websocket_receive_monotonic_ns: int,
         ) -> None:
             nonlocal segments_completed, audio_bytes_sent
             trace_id = uuid.uuid4().hex
-            segment_started_ns = time.time_ns()
             segment_started_monotonic_ns = time.monotonic_ns()
             payload: dict[str, object] = {
                 "model": MODEL_ID,
@@ -1883,6 +1905,8 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                 json=payload,
                 headers={"X-Trace-Id": trace_id},
             )
+            vllm_request_sent_wall_ns = time.time_ns()
+            vllm_request_sent_monotonic_ns = time.monotonic_ns()
             upstream = await websocket.app.state.vllm_client.send(
                 upstream_request,
                 stream=True,
@@ -1890,7 +1914,11 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             input_bytes = 0
             output_bytes = 0
             output_chunks = 0
-            first_audio_ns = None
+            first_audio_monotonic_ns = None
+            first_24khz_audio_wall_ns = None
+            first_24khz_audio_monotonic_ns = None
+            first_8khz_pcm_sent_wall_ns = None
+            first_8khz_pcm_sent_monotonic_ns = None
             remainder = b""
             resampler = av.AudioResampler(
                 format="s16",
@@ -1911,6 +1939,9 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                 async for chunk in upstream.aiter_raw():
                     if not chunk:
                         continue
+                    if first_24khz_audio_wall_ns is None:
+                        first_24khz_audio_wall_ns = time.time_ns()
+                        first_24khz_audio_monotonic_ns = time.monotonic_ns()
                     input_bytes += len(chunk)
                     pcm = remainder + chunk
                     complete_bytes = len(pcm) - (len(pcm) % 2)
@@ -1928,10 +1959,13 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                         output_chunk = output.to_ndarray().astype("<i2", copy=False).tobytes()
                         if not output_chunk:
                             continue
-                        if first_audio_ns is None:
-                            first_audio_ns = time.time_ns()
+                        if first_audio_monotonic_ns is None:
+                            first_audio_monotonic_ns = time.monotonic_ns()
                         async with send_lock:
                             await websocket.send_bytes(output_chunk)
+                        if first_8khz_pcm_sent_wall_ns is None:
+                            first_8khz_pcm_sent_wall_ns = time.time_ns()
+                            first_8khz_pcm_sent_monotonic_ns = time.monotonic_ns()
                         output_bytes += len(output_chunk)
                         output_chunks += 1
                 if remainder:
@@ -1940,18 +1974,63 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                     output_chunk = output.to_ndarray().astype("<i2", copy=False).tobytes()
                     if not output_chunk:
                         continue
-                    if first_audio_ns is None:
-                        first_audio_ns = time.time_ns()
+                    if first_audio_monotonic_ns is None:
+                        first_audio_monotonic_ns = time.monotonic_ns()
                     async with send_lock:
                         await websocket.send_bytes(output_chunk)
+                    if first_8khz_pcm_sent_wall_ns is None:
+                        first_8khz_pcm_sent_wall_ns = time.time_ns()
+                        first_8khz_pcm_sent_monotonic_ns = time.monotonic_ns()
                     output_bytes += len(output_chunk)
                     output_chunks += 1
             finally:
                 await upstream.aclose()
 
             completed_ns = time.time_ns()
+            completed_monotonic_ns = time.monotonic_ns()
             segments_completed += 1
             audio_bytes_sent += output_bytes
+            timing_metrics = {
+                "websocket_receive_to_vllm_send_ms": round(
+                    (vllm_request_sent_monotonic_ns - websocket_receive_monotonic_ns) / 1_000_000,
+                    3,
+                ),
+                "vllm_send_to_first_24khz_audio_ms": (
+                    round(
+                        (first_24khz_audio_monotonic_ns - vllm_request_sent_monotonic_ns)
+                        / 1_000_000,
+                        3,
+                    )
+                    if first_24khz_audio_monotonic_ns is not None
+                    else None
+                ),
+                "first_24khz_audio_to_first_8khz_pcm_sent_ms": (
+                    round(
+                        (first_8khz_pcm_sent_monotonic_ns - first_24khz_audio_monotonic_ns)
+                        / 1_000_000,
+                        3,
+                    )
+                    if first_24khz_audio_monotonic_ns is not None
+                    and first_8khz_pcm_sent_monotonic_ns is not None
+                    else None
+                ),
+                "queue_ms": round(
+                    (segment_started_monotonic_ns - enqueued_ns) / 1_000_000,
+                    3,
+                ),
+                "first_audio_ms": (
+                    round(
+                        (first_audio_monotonic_ns - segment_started_monotonic_ns) / 1_000_000,
+                        3,
+                    )
+                    if first_audio_monotonic_ns is not None
+                    else None
+                ),
+                "generation_ms": round(
+                    (completed_monotonic_ns - segment_started_monotonic_ns) / 1_000_000,
+                    3,
+                ),
+            }
             await send_json(
                 {
                     "type": "segment_done",
@@ -1960,19 +2039,11 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                     "text_characters": len(text),
                     "output_bytes": output_bytes,
                     "output_chunks": output_chunks,
-                    "queue_ms": round(
-                        (segment_started_monotonic_ns - enqueued_ns) / 1_000_000,
-                        3,
-                    ),
-                    "first_audio_ms": (
-                        round((first_audio_ns - segment_started_ns) / 1_000_000, 3)
-                        if first_audio_ns is not None
-                        else None
-                    ),
-                    "generation_ms": round(
-                        (completed_ns - segment_started_ns) / 1_000_000,
-                        3,
-                    ),
+                    "websocket_receive_wall_ns": websocket_receive_wall_ns,
+                    "vllm_request_sent_wall_ns": vllm_request_sent_wall_ns,
+                    "first_24khz_audio_wall_ns": first_24khz_audio_wall_ns,
+                    "first_8khz_pcm_sent_wall_ns": first_8khz_pcm_sent_wall_ns,
+                    **timing_metrics,
                 }
             )
             print(
@@ -1986,6 +2057,7 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                         "input_bytes": input_bytes,
                         "output_bytes": output_bytes,
                         "output_chunks": output_chunks,
+                        **timing_metrics,
                         "wall_time_ns": completed_ns,
                     },
                     separators=(",", ":"),
@@ -2019,17 +2091,17 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                 segment_id = int(item["segment_id"])
                 text = str(item["text"])
                 enqueued_ns = int(item["enqueued_ns"])
-                context_id = (
-                    str(item["context_id"])
-                    if item["context_id"] is not None
-                    else None
-                )
+                websocket_receive_wall_ns = int(item["websocket_receive_wall_ns"])
+                websocket_receive_monotonic_ns = int(item["websocket_receive_monotonic_ns"])
+                context_id = str(item["context_id"]) if item["context_id"] is not None else None
                 try:
                     await synthesize_segment(
                         segment_id,
                         text,
                         enqueued_ns,
                         context_id,
+                        websocket_receive_wall_ns,
+                        websocket_receive_monotonic_ns,
                     )
                 except Exception as exc:
                     await send_json(

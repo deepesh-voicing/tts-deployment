@@ -180,6 +180,9 @@ class TTSAttempt:
     websocket_send_completed_wall_ns: int | None = None
     modal_websocket_receive_wall_ns: int | None = None
     modal_vllm_request_sent_wall_ns: int | None = None
+    modal_first_24khz_audio_wall_ns: int | None = None
+    modal_first_8khz_pcm_sent_wall_ns: int | None = None
+    realtime_segments: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
 
 
@@ -232,10 +235,13 @@ class TTSRequest:
     websocket_send_completed_at: float | None = None
     websocket_send_completed_wall_ns: int | None = None
     modal_websocket_receive_wall_ns: int | None = None
+    modal_first_24khz_audio_wall_ns: int | None = None
+    modal_first_8khz_pcm_sent_wall_ns: int | None = None
     websocket_connection_id: str | None = None
     websocket_request_on_connection: int | None = None
     websocket_connection_age_at_send_seconds: float | None = None
     attempts: list[TTSAttempt] = field(default_factory=list)
+    realtime_segments: list[dict[str, Any]] = field(default_factory=list)
     timeline_logged: bool = False
 
 
@@ -1402,6 +1408,58 @@ class QwenRealtimeTTSService(TTSService):
                 f"client={context.context_id} server={event_context_id}"
             )
 
+    @staticmethod
+    def _record_segment_timing(
+        context: RealtimeTTSContext,
+        event: dict[str, Any],
+    ) -> None:
+        request = context.request
+        attempt = context.attempt
+        if request is None or attempt is None:
+            raise RuntimeError("Realtime segment timing arrived without an active utterance")
+
+        timing: dict[str, Any] = {
+            "segment_id": event.get("segment_id"),
+            "text_characters": event.get("text_characters"),
+            "output_bytes": event.get("output_bytes"),
+            "output_chunks": event.get("output_chunks"),
+        }
+        for field_name in (
+            "websocket_receive_to_vllm_send_ms",
+            "vllm_send_to_first_24khz_audio_ms",
+            "first_24khz_audio_to_first_8khz_pcm_sent_ms",
+            "queue_ms",
+            "first_audio_ms",
+            "generation_ms",
+        ):
+            value = event.get(field_name)
+            timing[field_name] = (
+                round(float(value), 3)
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else None
+            )
+        for field_name in (
+            "websocket_receive_wall_ns",
+            "vllm_request_sent_wall_ns",
+            "first_24khz_audio_wall_ns",
+            "first_8khz_pcm_sent_wall_ns",
+        ):
+            value = event.get(field_name)
+            timing[field_name] = (
+                int(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else None
+            )
+
+        request.realtime_segments.append(timing)
+        attempt.realtime_segments.append(dict(timing))
+        if len(request.realtime_segments) == 1:
+            for target in (request, attempt):
+                target.modal_websocket_receive_wall_ns = timing["websocket_receive_wall_ns"]
+                target.modal_vllm_request_sent_wall_ns = timing["vllm_request_sent_wall_ns"]
+                target.modal_first_24khz_audio_wall_ns = timing["first_24khz_audio_wall_ns"]
+                target.modal_first_8khz_pcm_sent_wall_ns = timing["first_8khz_pcm_sent_wall_ns"]
+
     async def _receive_audio(self) -> None:
         try:
             while True:
@@ -1437,10 +1495,19 @@ class QwenRealtimeTTSService(TTSService):
                 if message.type == aiohttp.WSMsgType.TEXT:
                     event = json.loads(message.data)
                     event_type = event.get("type")
-                    if event_type in {"segment_started", "segment_done"}:
+                    if event_type == "segment_started":
                         context = self._context
                         if context is not None:
                             self._validate_event_context(context, event)
+                        continue
+                    if event_type == "segment_done":
+                        context = self._context
+                        if context is None:
+                            raise RuntimeError(
+                                "Realtime segment completed without an active utterance"
+                            )
+                        self._validate_event_context(context, event)
+                        self._record_segment_timing(context, event)
                         continue
                     if event_type == "flush_done":
                         context = self._context
@@ -1710,7 +1777,32 @@ def _wall_elapsed_ms(start_ns: int | None, end_ns: int | None) -> float | None:
     return round((end_ns - start_ns) / 1_000_000, 3)
 
 
+def _first_segment_metric(
+    segments: list[dict[str, Any]],
+    field_name: str,
+) -> float | None:
+    if not segments:
+        return None
+    value = segments[0].get(field_name)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _segment_metric_values(
+    segments: list[dict[str, Any]],
+    field_name: str,
+) -> list[float]:
+    return [
+        float(value)
+        for segment in segments
+        if isinstance((value := segment.get(field_name)), (int, float))
+    ]
+
+
 def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
+    receive_to_vllm_ms = _first_segment_metric(
+        attempt.realtime_segments,
+        "websocket_receive_to_vllm_send_ms",
+    )
     return {
         "attempt_id": attempt.attempt_id,
         "attempt": attempt.number,
@@ -1760,11 +1852,34 @@ def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
         "websocket_receive_to_vllm_send_ms": _wall_elapsed_ms(
             attempt.modal_websocket_receive_wall_ns,
             attempt.modal_vllm_request_sent_wall_ns,
+        )
+        if receive_to_vllm_ms is None
+        else receive_to_vllm_ms,
+        "vllm_send_to_first_24khz_audio_ms": _first_segment_metric(
+            attempt.realtime_segments,
+            "vllm_send_to_first_24khz_audio_ms",
+        ),
+        "first_24khz_audio_to_first_8khz_pcm_sent_ms": _first_segment_metric(
+            attempt.realtime_segments,
+            "first_24khz_audio_to_first_8khz_pcm_sent_ms",
         ),
         "vllm_send_to_first_pcm_ms": _wall_elapsed_ms(
             attempt.modal_vllm_request_sent_wall_ns,
             attempt.first_body_wall_ns,
         ),
+        "segment_queue_ms": _segment_metric_values(
+            attempt.realtime_segments,
+            "queue_ms",
+        ),
+        "segment_first_audio_ms": _segment_metric_values(
+            attempt.realtime_segments,
+            "first_audio_ms",
+        ),
+        "segment_generation_ms": _segment_metric_values(
+            attempt.realtime_segments,
+            "generation_ms",
+        ),
+        "realtime_segments": attempt.realtime_segments,
         "error": attempt.error,
         "client_wall_time_ns": {
             "attempt_start": attempt.started_wall_ns,
@@ -1781,6 +1896,8 @@ def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
         "modal_wall_time_ns": {
             "websocket_receive": attempt.modal_websocket_receive_wall_ns,
             "vllm_request_sent": attempt.modal_vllm_request_sent_wall_ns,
+            "first_24khz_audio": attempt.modal_first_24khz_audio_wall_ns,
+            "first_8khz_pcm_sent": attempt.modal_first_8khz_pcm_sent_wall_ns,
         },
     }
 
@@ -1790,6 +1907,10 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
     first_playable_ttfa_ms = _elapsed_ms(request.started_at, request.first_playable_at)
     request_ms = _elapsed_ms(request.started_at, request.ended_at)
     audio_duration_ms = request.audio_bytes / (request.sample_rate * 2) * 1000
+    receive_to_vllm_ms = _first_segment_metric(
+        request.realtime_segments,
+        "websocket_receive_to_vllm_send_ms",
+    )
     return {
         "trace_id": request.trace_id,
         "transport": request.transport,
@@ -1841,6 +1962,16 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
         "websocket_receive_to_vllm_send_ms": _wall_elapsed_ms(
             request.modal_websocket_receive_wall_ns,
             request.modal_vllm_request_sent_wall_ns,
+        )
+        if receive_to_vllm_ms is None
+        else receive_to_vllm_ms,
+        "vllm_send_to_first_24khz_audio_ms": _first_segment_metric(
+            request.realtime_segments,
+            "vllm_send_to_first_24khz_audio_ms",
+        ),
+        "first_24khz_audio_to_first_8khz_pcm_sent_ms": _first_segment_metric(
+            request.realtime_segments,
+            "first_24khz_audio_to_first_8khz_pcm_sent_ms",
         ),
         "vllm_send_to_first_pcm_ms": _wall_elapsed_ms(
             request.modal_vllm_request_sent_wall_ns,
@@ -1874,6 +2005,19 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
         ),
         "attempt_count": len(request.attempts),
         "retry_count": max(0, len(request.attempts) - 1),
+        "segment_queue_ms": _segment_metric_values(
+            request.realtime_segments,
+            "queue_ms",
+        ),
+        "segment_first_audio_ms": _segment_metric_values(
+            request.realtime_segments,
+            "first_audio_ms",
+        ),
+        "segment_generation_ms": _segment_metric_values(
+            request.realtime_segments,
+            "generation_ms",
+        ),
+        "realtime_segments": request.realtime_segments,
         "attempts": [_tts_attempt_report(attempt) for attempt in request.attempts],
         "client_wall_time_ns": {
             "request_start": request.started_wall_ns,
@@ -1894,6 +2038,8 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
             "upstream_request_built": request.modal_upstream_request_built_wall_ns,
             "vllm_request_sent": request.modal_vllm_request_sent_wall_ns,
             "websocket_receive": request.modal_websocket_receive_wall_ns,
+            "first_24khz_audio": request.modal_first_24khz_audio_wall_ns,
+            "first_8khz_pcm_sent": request.modal_first_8khz_pcm_sent_wall_ns,
         },
     }
 
@@ -2009,6 +2155,16 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
             for request in request_reports
             if request["websocket_receive_to_vllm_send_ms"] is not None
         ],
+        "vllm_send_to_first_24khz_audio_ms": [
+            request["vllm_send_to_first_24khz_audio_ms"]
+            for request in request_reports
+            if request["vllm_send_to_first_24khz_audio_ms"] is not None
+        ],
+        "first_24khz_audio_to_first_8khz_pcm_sent_ms": [
+            request["first_24khz_audio_to_first_8khz_pcm_sent_ms"]
+            for request in request_reports
+            if request["first_24khz_audio_to_first_8khz_pcm_sent_ms"] is not None
+        ],
         "vllm_send_to_first_pcm_ms": [
             request["vllm_send_to_first_pcm_ms"]
             for request in request_reports
@@ -2023,6 +2179,15 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
             request["websocket_connection_age_at_send_ms"]
             for request in request_reports
             if request["websocket_connection_age_at_send_ms"] is not None
+        ],
+        "segment_queue_ms": [
+            value for request in request_reports for value in request["segment_queue_ms"]
+        ],
+        "segment_first_audio_ms": [
+            value for request in request_reports for value in request["segment_first_audio_ms"]
+        ],
+        "segment_generation_ms": [
+            value for request in request_reports for value in request["segment_generation_ms"]
         ],
         "inter_audio_ms": _milliseconds(turn.inter_audio_seconds),
         "playback_gap_ms": _milliseconds(turn.playback_gap_seconds),
@@ -2185,6 +2350,14 @@ async def run_call(
             for turn in turns
             for value in turn["websocket_receive_to_vllm_send_ms"]
         ],
+        "vllm_send_to_first_24khz_audio_ms": [
+            value for turn in turns for value in turn["vllm_send_to_first_24khz_audio_ms"]
+        ],
+        "first_24khz_audio_to_first_8khz_pcm_sent_ms": [
+            value
+            for turn in turns
+            for value in turn["first_24khz_audio_to_first_8khz_pcm_sent_ms"]
+        ],
         "vllm_send_to_first_pcm_ms": [
             value for turn in turns for value in turn["vllm_send_to_first_pcm_ms"]
         ],
@@ -2195,6 +2368,13 @@ async def run_call(
             value
             for turn in turns
             for value in turn["websocket_connection_age_at_send_ms"]
+        ],
+        "segment_queue_ms": [value for turn in turns for value in turn["segment_queue_ms"]],
+        "segment_first_audio_ms": [
+            value for turn in turns for value in turn["segment_first_audio_ms"]
+        ],
+        "segment_generation_ms": [
+            value for turn in turns for value in turn["segment_generation_ms"]
         ],
         "inter_audio_ms": [value for turn in turns for value in turn["inter_audio_ms"]],
         "playback_gap_ms": [value for turn in turns for value in turn["playback_gap_ms"]],
@@ -2454,9 +2634,14 @@ def build_load_report(
         "client_send_to_websocket_receive_ms",
         "client_send_complete_to_websocket_receive_ms",
         "websocket_receive_to_vllm_send_ms",
+        "vllm_send_to_first_24khz_audio_ms",
+        "first_24khz_audio_to_first_8khz_pcm_sent_ms",
         "vllm_send_to_first_pcm_ms",
         "client_send_to_first_pcm_ms",
         "websocket_connection_age_at_send_ms",
+        "segment_queue_ms",
+        "segment_first_audio_ms",
+        "segment_generation_ms",
         "tts_processing_ms",
         "inter_audio_ms",
         "playback_gap_ms",

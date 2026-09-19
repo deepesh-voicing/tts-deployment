@@ -269,6 +269,8 @@ async def _run_local_pipeline(
                     ]
                     assert [item["flush"] for item in text_events] == [False, True]
                     assert {item["context_id"] for item in text_events} == {context_id}
+                    websocket_receive_wall_ns = time.time_ns()
+                    vllm_request_sent_wall_ns = time.time_ns()
                     await websocket.send_json(
                         {
                             "type": "segment_started",
@@ -276,7 +278,9 @@ async def _run_local_pipeline(
                             "context_id": context_id,
                         }
                     )
+                    first_24khz_audio_wall_ns = time.time_ns()
                     await websocket.send_bytes(b"\x00\x00" * 2400)
+                    first_8khz_pcm_sent_wall_ns = time.time_ns()
                     await asyncio.sleep(0.01)
                     await websocket.send_bytes(b"\xe8\x03" * 2400)
                     await asyncio.sleep(0.01)
@@ -289,6 +293,16 @@ async def _run_local_pipeline(
                             "text_characters": 48,
                             "output_bytes": 14_400,
                             "output_chunks": 3,
+                            "websocket_receive_wall_ns": websocket_receive_wall_ns,
+                            "vllm_request_sent_wall_ns": vllm_request_sent_wall_ns,
+                            "first_24khz_audio_wall_ns": first_24khz_audio_wall_ns,
+                            "first_8khz_pcm_sent_wall_ns": first_8khz_pcm_sent_wall_ns,
+                            "websocket_receive_to_vllm_send_ms": 1.25,
+                            "vllm_send_to_first_24khz_audio_ms": 2.5,
+                            "first_24khz_audio_to_first_8khz_pcm_sent_ms": 0.75,
+                            "queue_ms": 0.5,
+                            "first_audio_ms": 3.25,
+                            "generation_ms": 20.0,
                         }
                     )
                     await websocket.send_json(
@@ -508,7 +522,7 @@ def test_websocket_url_is_derived_from_http_endpoint():
 
 
 def test_realtime_websocket_streams_llm_chunks_and_records_audio(tmp_path):
-    _, results = asyncio.run(
+    config, results = asyncio.run(
         _run_local_pipeline(
             tmp_path,
             tts_transport="realtime_websocket",
@@ -542,6 +556,26 @@ def test_realtime_websocket_streams_llm_chunks_and_records_audio(tmp_path):
     assert all(timeline["body_chunk_count"] == 3 for timeline in timelines)
     assert all(timeline["body_bytes"] == 14_400 for timeline in timelines)
     assert all(timeline["attempt_count"] == 1 for timeline in timelines)
+    assert all(timeline["websocket_receive_to_vllm_send_ms"] == 1.25 for timeline in timelines)
+    assert all(timeline["vllm_send_to_first_24khz_audio_ms"] == 2.5 for timeline in timelines)
+    assert all(
+        timeline["first_24khz_audio_to_first_8khz_pcm_sent_ms"] == 0.75 for timeline in timelines
+    )
+    assert all(timeline["segment_queue_ms"] == [0.5] for timeline in timelines)
+    assert all(timeline["segment_first_audio_ms"] == [3.25] for timeline in timelines)
+    assert all(timeline["segment_generation_ms"] == [20.0] for timeline in timelines)
+    assert all(len(timeline["realtime_segments"]) == 1 for timeline in timelines)
+
+    report = build_load_report(
+        config,
+        results,
+        concurrency=1,
+        duration_seconds=1.1,
+        phase_wall_seconds=results[0]["actual_call_seconds"],
+        modal_average_containers=1,
+    )
+    assert report["summary"]["vllm_send_to_first_24khz_audio_ms"]["count"] == len(timelines)
+    assert report["summary"]["segment_queue_ms"]["count"] == len(timelines)
 
 
 def test_realtime_websocket_url_uses_native_8khz_pcm():
