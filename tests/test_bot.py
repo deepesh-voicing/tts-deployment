@@ -76,6 +76,7 @@ async def _run_local_pipeline(
     call_count: int = 1,
     first_tts_header_delay_seconds: float = 0.0,
     tts_transport: str = "http",
+    duration_seconds: float = 0.01,
 ):
     tts_post_count = 0
 
@@ -234,10 +235,83 @@ async def _run_local_pipeline(
             )
         return websocket
 
+    async def tts_realtime_websocket_handler(request):
+        assert request.match_info["voice_id"] == "Vivian"
+        assert request.query == {
+            "output_format": "pcm_8000",
+            "inactivity_timeout": "30",
+            "language": "English",
+        }
+        assert request.headers["Authorization"] == "Bearer test-token"
+
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        await websocket.send_json(
+            {
+                "type": "ready",
+                "connection_id": "local-realtime-connection",
+                "sample_rate": 8000,
+                "channels": 1,
+                "encoding": "pcm_s16le",
+            }
+        )
+        text_events = []
+        async for message in websocket:
+            assert message.type == web.WSMsgType.TEXT
+            event = json.loads(message.data)
+            if event["type"] == "text":
+                text_events.append(event)
+                if event["flush"]:
+                    context_id = event["context_id"]
+                    assert [item["text"] for item in text_events] == [
+                        "Hello from the test. ",
+                        "This is sentence two.",
+                    ]
+                    assert [item["flush"] for item in text_events] == [False, True]
+                    assert {item["context_id"] for item in text_events} == {context_id}
+                    await websocket.send_json(
+                        {
+                            "type": "segment_started",
+                            "segment_id": 1,
+                            "context_id": context_id,
+                        }
+                    )
+                    await websocket.send_bytes(b"\x00\x00" * 2400)
+                    await asyncio.sleep(0.01)
+                    await websocket.send_bytes(b"\xe8\x03" * 2400)
+                    await asyncio.sleep(0.01)
+                    await websocket.send_bytes(b"\xe8\x03" * 2400)
+                    await websocket.send_json(
+                        {
+                            "type": "segment_done",
+                            "segment_id": 1,
+                            "context_id": context_id,
+                            "text_characters": 48,
+                            "output_bytes": 14_400,
+                            "output_chunks": 3,
+                        }
+                    )
+                    await websocket.send_json(
+                        {"type": "flush_done", "context_id": context_id}
+                    )
+                    text_events = []
+                continue
+            assert event == {"type": "close"}
+            await websocket.send_json(
+                {"type": "final", "segments_completed": 1, "audio_bytes": 14_400}
+            )
+            await websocket.close()
+            break
+        return websocket
+
     app = web.Application()
     app.router.add_post("/v1/chat/completions", chat_handler)
     app.router.add_post("/tts", tts_handler)
     app.router.add_get("/tts/ws", tts_websocket_handler)
+    app.router.add_get(
+        "/tts/v1/text-to-speech/{voice_id}/stream-input",
+        tts_realtime_websocket_handler,
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -247,7 +321,7 @@ async def _run_local_pipeline(
     config = BotConfig(
         model="voxcpm2",
         tts_url=f"http://127.0.0.1:{port}/tts",
-        tts_bearer_token=None,
+        tts_bearer_token="test-token",
         sample_rate=8000,
         tts_source_sample_rate=24000,
         tts_timeout_seconds=5,
@@ -275,7 +349,7 @@ async def _run_local_pipeline(
                     config,
                     call_id=call_id,
                     scenario=scenario,
-                    duration_seconds=0.01,
+                    duration_seconds=duration_seconds,
                     output_dir=tmp_path,
                 )
                 for call_id in range(1, call_count + 1)
@@ -430,6 +504,54 @@ def test_websocket_url_is_derived_from_http_endpoint():
             "https://example.modal.run/v1/audio/speech"
         )
         == "wss://example.modal.run/v1/audio/speech/ws"
+    )
+
+
+def test_realtime_websocket_streams_llm_chunks_and_records_audio(tmp_path):
+    _, results = asyncio.run(
+        _run_local_pipeline(
+            tmp_path,
+            tts_transport="realtime_websocket",
+            duration_seconds=1.1,
+        )
+    )
+
+    result = results[0]
+    timelines = [
+        turn["tts_requests"][0]
+        for turn in result["turns"]
+        if turn["tts_requests"]
+    ]
+    assert result["success"] is True
+    assert result["errors"] == []
+    assert len(timelines) >= 2
+    assert {timeline["transport"] for timeline in timelines} == {
+        "realtime_websocket"
+    }
+    assert {timeline["websocket_connection_id"] for timeline in timelines} == {
+        "local-realtime-connection"
+    }
+    assert [timeline["websocket_request_on_connection"] for timeline in timelines] == list(
+        range(1, len(timelines) + 1)
+    )
+    assert timelines[0]["connection_reused"] is False
+    assert all(timeline["connection_reused"] is True for timeline in timelines[1:])
+    assert all(timeline["websocket_send_ms"] is not None for timeline in timelines)
+    assert all(timeline["first_body_ms"] is not None for timeline in timelines)
+    assert all(timeline["first_playable_ttfa_ms"] is not None for timeline in timelines)
+    assert all(timeline["body_chunk_count"] == 3 for timeline in timelines)
+    assert all(timeline["body_bytes"] == 14_400 for timeline in timelines)
+    assert all(timeline["attempt_count"] == 1 for timeline in timelines)
+
+
+def test_realtime_websocket_url_uses_native_8khz_pcm():
+    assert bot_module.QwenRealtimeTTSService._realtime_websocket_url(
+        "https://example.modal.run/",
+        voice="aiden",
+        language="English",
+    ) == (
+        "wss://example.modal.run/v1/text-to-speech/aiden/stream-input"
+        "?output_format=pcm_8000&inactivity_timeout=30&language=English"
     )
 
 

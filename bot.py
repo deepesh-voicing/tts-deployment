@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import aiohttp
 import yaml
@@ -48,7 +49,7 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.settings import TTSSettings
-from pipecat.services.tts_service import TTSService
+from pipecat.services.tts_service import TextAggregationMode, TTSService
 from pipecat.utils.text.base_text_aggregator import Aggregation, BaseTextAggregator
 from pipecat.workers.runner import WorkerRunner
 
@@ -236,6 +237,18 @@ class TTSRequest:
     websocket_connection_age_at_send_seconds: float | None = None
     attempts: list[TTSAttempt] = field(default_factory=list)
     timeline_logged: bool = False
+
+
+@dataclass
+class RealtimeTTSContext:
+    context_id: str
+    pending_text: str | None = None
+    full_text: str = ""
+    request: TTSRequest | None = None
+    attempt: TTSAttempt | None = None
+    completed: asyncio.Event = field(default_factory=asyncio.Event)
+    audio_context_closed: bool = False
+    error: Exception | None = None
 
 
 @dataclass
@@ -1118,6 +1131,437 @@ class ModalTTSService(TTSService):
             await self.stop_ttfb_metrics()
 
 
+class QwenRealtimeTTSService(TTSService):
+    """Streams all turns in one simulated call over one authenticated socket."""
+
+    def __init__(self, config: BotConfig, state: CallState):
+        super().__init__(
+            name=f"tts:{config.model}",
+            text_aggregation_mode=TextAggregationMode.TOKEN,
+            sample_rate=8_000,
+            push_start_frame=True,
+            push_stop_frames=True,
+            stop_frame_timeout_s=config.tts_timeout_seconds + 1,
+            reuse_context_id_within_turn=True,
+            settings=TTSSettings(
+                model=config.model,
+                voice=config.tts_voice,
+                language=config.tts_language,
+            ),
+        )
+        self._config = config
+        self._state = state
+        self._timeout = aiohttp.ClientTimeout(total=config.tts_timeout_seconds)
+        self._session: aiohttp.ClientSession | None = None
+        self._websocket: aiohttp.ClientWebSocketResponse | None = None
+        self._receiver_task: asyncio.Task[None] | None = None
+        self._final_received = asyncio.Event()
+        self._context: RealtimeTTSContext | None = None
+        self._connection_started_at: float | None = None
+        self._connection_ready_at: float | None = None
+        self._connection_ready_wall_ns: int | None = None
+        self._connection_id: str | None = None
+        self._requests_on_connection = 0
+        self._connection_error: Exception | None = None
+
+    @property
+    def supports_processing_metrics(self) -> bool:
+        return False
+
+    def can_generate_metrics(self) -> bool:
+        return True
+
+    @staticmethod
+    def _realtime_websocket_url(
+        base_url: str,
+        *,
+        voice: str,
+        language: str | None,
+    ) -> str:
+        url = base_url.rstrip("/")
+        if url.startswith("https://"):
+            url = "wss://" + url.removeprefix("https://")
+        elif url.startswith("http://"):
+            url = "ws://" + url.removeprefix("http://")
+        elif not url.startswith(("ws://", "wss://")):
+            raise ValueError("Realtime WebSocket TTS URL must use http(s) or ws(s)")
+        query: dict[str, str | int] = {
+            "output_format": "pcm_8000",
+            "inactivity_timeout": 30,
+        }
+        if language:
+            query["language"] = language
+        return (
+            f"{url}/v1/text-to-speech/{quote(voice, safe='')}/stream-input"
+            f"?{urlencode(query)}"
+        )
+
+    async def start(self, frame):
+        await super().start(frame)
+        global _TTS_SESSIONS_ACTIVE, _TTS_SESSIONS_CREATED
+        self._session = aiohttp.ClientSession(
+            timeout=self._timeout,
+            connector=aiohttp.TCPConnector(keepalive_timeout=60.0),
+        )
+        _TTS_SESSIONS_CREATED += 1
+        _TTS_SESSIONS_ACTIVE += 1
+        await self._connect()
+
+    async def stop(self, frame):
+        await super().stop(frame)
+        await self._close(graceful=True)
+
+    async def cancel(self, frame):
+        await super().cancel(frame)
+        await self._close(graceful=False)
+
+    async def cleanup(self):
+        await super().cleanup()
+        await self._close(graceful=False)
+
+    async def _connect(self) -> None:
+        if self._session is None:
+            raise RuntimeError("TTS WebSocket session was not started")
+        if not self._config.tts_voice:
+            raise RuntimeError("Realtime WebSocket TTS requires --tts-voice")
+
+        headers = (
+            {"Authorization": f"Bearer {self._config.tts_bearer_token}"}
+            if self._config.tts_bearer_token
+            else None
+        )
+        started_at = time.perf_counter()
+        websocket = await self._session.ws_connect(
+            self._realtime_websocket_url(
+                self._config.tts_url,
+                voice=self._config.tts_voice,
+                language=self._config.tts_language,
+            ),
+            headers=headers,
+            heartbeat=15.0,
+            autoping=True,
+        )
+        try:
+            message = await asyncio.wait_for(
+                websocket.receive(),
+                timeout=min(
+                    TTS_RESPONSE_HEADER_TIMEOUT_SECONDS,
+                    self._config.tts_timeout_seconds,
+                ),
+            )
+            if message.type != aiohttp.WSMsgType.TEXT:
+                raise RuntimeError("Expected realtime WebSocket ready event")
+            event = json.loads(message.data)
+            if event.get("type") != "ready":
+                raise RuntimeError(f"Expected ready, received {event!r}")
+            if (
+                int(event.get("sample_rate", 0)) != 8_000
+                or int(event.get("channels", 0)) != 1
+                or event.get("encoding") != "pcm_s16le"
+            ):
+                raise RuntimeError(f"Unsupported realtime audio format: {event!r}")
+        except BaseException:
+            await websocket.close()
+            raise
+
+        self._websocket = websocket
+        self._connection_started_at = started_at
+        self._connection_ready_at = time.perf_counter()
+        self._connection_ready_wall_ns = time.time_ns()
+        self._connection_id = (
+            str(event["connection_id"])
+            if event.get("connection_id") is not None
+            else None
+        )
+        self._requests_on_connection = 0
+        self._connection_error = None
+        self._final_received.clear()
+        self._receiver_task = asyncio.create_task(self._receive_audio())
+
+    async def _close(self, *, graceful: bool) -> None:
+        websocket = self._websocket
+        receiver_task = self._receiver_task
+        self._context = None
+
+        if websocket is not None and not websocket.closed:
+            if graceful and receiver_task is not None and not receiver_task.done():
+                try:
+                    await websocket.send_json({"type": "close"})
+                    await asyncio.wait_for(
+                        self._final_received.wait(),
+                        timeout=min(5.0, self._config.tts_timeout_seconds),
+                    )
+                except Exception as exc:  # noqa: BLE001 - teardown still closes the socket
+                    logger.debug("Realtime WebSocket graceful close failed: {}", exc)
+            await websocket.close()
+        if receiver_task is not None and not receiver_task.done():
+            receiver_task.cancel()
+            await asyncio.gather(receiver_task, return_exceptions=True)
+        self._websocket = None
+        self._receiver_task = None
+
+        session = self._session
+        self._session = None
+        await _close_tracked_tts_session(session)
+
+    async def on_turn_context_created(self, context_id: str):
+        if (
+            self._websocket is None
+            or self._websocket.closed
+            or self._receiver_task is None
+            or self._receiver_task.done()
+        ):
+            await self._connect()
+        if self._context is not None:
+            raise RuntimeError("Previous realtime TTS context is still active")
+        self._context = RealtimeTTSContext(context_id=context_id)
+
+    def _ensure_request(self, context: RealtimeTTSContext) -> tuple[TTSRequest, TTSAttempt]:
+        if context.request is not None and context.attempt is not None:
+            context.request.text = context.full_text
+            return context.request, context.attempt
+        if (
+            self._connection_started_at is None
+            or self._connection_ready_at is None
+            or self._connection_ready_wall_ns is None
+        ):
+            raise RuntimeError("Realtime TTS WebSocket is not ready")
+
+        request = self._state.begin_tts_request(
+            context.full_text,
+            transport="realtime_websocket",
+        )
+        attempt = ModalTTSService._start_attempt(request)
+        connection_reused = self._requests_on_connection > 0
+        connection_seconds = (
+            0.0
+            if connection_reused
+            else self._connection_ready_at - self._connection_started_at
+        )
+        for target in (request, attempt):
+            target.connection_reused = connection_reused
+            target.connection_create_seconds = connection_seconds
+            target.connection_ready_at = self._connection_ready_at
+            target.connection_ready_wall_ns = self._connection_ready_wall_ns
+        self._requests_on_connection += 1
+        request.websocket_connection_id = self._connection_id
+        request.websocket_request_on_connection = self._requests_on_connection
+        request.websocket_connection_age_at_send_seconds = max(
+            0.0,
+            time.perf_counter() - self._connection_ready_at,
+        )
+        context.request = request
+        context.attempt = attempt
+        return request, attempt
+
+    async def _send_text(
+        self,
+        context: RealtimeTTSContext,
+        text: str,
+        *,
+        flush: bool,
+    ) -> None:
+        websocket = self._websocket
+        if websocket is None or websocket.closed:
+            raise RuntimeError("Realtime TTS WebSocket is not connected")
+        request, attempt = self._ensure_request(context)
+        first_send = request.websocket_send_started_at is None
+        if first_send:
+            ModalTTSService._record_websocket_send_start(request, attempt)
+        await websocket.send_json(
+            {
+                "type": "text",
+                "context_id": context.context_id,
+                "text": text,
+                "flush": flush,
+            }
+        )
+        if first_send:
+            ModalTTSService._record_websocket_send_complete(request, attempt)
+
+    async def _finish_audio_context(self, context: RealtimeTTSContext) -> None:
+        if context.audio_context_closed:
+            return
+        context.audio_context_closed = True
+        if self.audio_context_available(context.context_id):
+            await self.append_to_audio_context(
+                context.context_id,
+                TTSStoppedFrame(context_id=context.context_id),
+            )
+            await self.remove_audio_context(context.context_id)
+
+    @staticmethod
+    def _validate_event_context(
+        context: RealtimeTTSContext,
+        event: dict[str, Any],
+    ) -> None:
+        event_context_id = event.get("context_id")
+        if event_context_id is not None and event_context_id != context.context_id:
+            raise RuntimeError(
+                "Realtime TTS context mismatch: "
+                f"client={context.context_id} server={event_context_id}"
+            )
+
+    async def _receive_audio(self) -> None:
+        try:
+            while True:
+                websocket = self._websocket
+                if websocket is None:
+                    return
+                message = await websocket.receive()
+                if message.type == aiohttp.WSMsgType.BINARY:
+                    chunk = bytes(message.data)
+                    if not chunk:
+                        continue
+                    if len(chunk) % 2:
+                        raise RuntimeError("Realtime TTS returned incomplete PCM16 audio")
+                    context = self._context
+                    if context is None or context.request is None or context.attempt is None:
+                        raise RuntimeError("Realtime audio arrived without an active utterance")
+                    self._state.received_tts_body(
+                        context.request,
+                        context.attempt,
+                        len(chunk),
+                    )
+                    await self.stop_ttfb_metrics()
+                    await self.append_to_audio_context(
+                        context.context_id,
+                        TTSAudioRawFrame(
+                            chunk,
+                            sample_rate=8_000,
+                            num_channels=1,
+                            context_id=context.context_id,
+                        ),
+                    )
+                    continue
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    event = json.loads(message.data)
+                    event_type = event.get("type")
+                    if event_type in {"segment_started", "segment_done"}:
+                        context = self._context
+                        if context is not None:
+                            self._validate_event_context(context, event)
+                        continue
+                    if event_type == "flush_done":
+                        context = self._context
+                        if context is None:
+                            raise RuntimeError("Realtime flush completed without an active utterance")
+                        self._validate_event_context(context, event)
+                        await self._finish_audio_context(context)
+                        context.completed.set()
+                        continue
+                    if event_type == "pong":
+                        continue
+                    if event_type == "final":
+                        self._final_received.set()
+                        return
+                    if event_type == "error":
+                        raise RuntimeError(
+                            f"Realtime TTS server error: {event.get('error') or 'unknown'}"
+                        )
+                    raise RuntimeError(
+                        f"Unsupported realtime WebSocket response: {event_type!r}"
+                    )
+                if message.type in {
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                }:
+                    if self._final_received.is_set():
+                        return
+                    raise aiohttp.ClientConnectionError(
+                        "Realtime TTS WebSocket closed before final"
+                    )
+                if message.type == aiohttp.WSMsgType.ERROR:
+                    raise aiohttp.ClientConnectionError(
+                        f"Realtime TTS WebSocket error: {websocket.exception()}"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced through the active turn
+            self._connection_error = exc
+            context = self._context
+            if context is not None:
+                context.error = exc
+                if context.attempt is not None:
+                    context.attempt.error = f"{type(exc).__name__}: {exc}"
+                await self._finish_audio_context(context)
+                context.completed.set()
+        finally:
+            self._final_received.set()
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
+        context = self._context
+        if context is None or context.context_id != context_id:
+            yield ErrorFrame(error="Realtime TTS utterance context is not active")
+            return
+        if context.error is not None:
+            yield ErrorFrame(
+                error=f"Realtime TTS request failed: {context.error}",
+                exception=context.error,
+            )
+            return
+
+        context.full_text += text
+        if context.request is not None:
+            context.request.text = context.full_text
+        try:
+            if context.pending_text is not None:
+                await self._send_text(context, context.pending_text, flush=False)
+            context.pending_text = text
+            yield None
+        except Exception as exc:  # noqa: BLE001 - convert provider failures to pipeline errors
+            context.error = exc
+            if context.attempt is not None:
+                context.attempt.error = f"{type(exc).__name__}: {exc}"
+            yield ErrorFrame(error=f"Realtime TTS request failed: {exc}", exception=exc)
+
+    async def flush_audio(self, context_id: str | None = None):
+        context = self._context
+        if context is None or (context_id is not None and context.context_id != context_id):
+            return
+
+        try:
+            if context.error is not None:
+                raise context.error
+            if context.pending_text is not None:
+                await self._send_text(context, context.pending_text, flush=True)
+                context.pending_text = None
+            await asyncio.wait_for(
+                context.completed.wait(),
+                timeout=self._config.tts_timeout_seconds,
+            )
+            if context.error is not None:
+                raise context.error
+        except Exception as exc:  # noqa: BLE001 - convert provider failures to pipeline errors
+            context.error = exc
+            if context.attempt is not None:
+                context.attempt.error = f"{type(exc).__name__}: {exc}"
+            await self.push_error_frame(
+                ErrorFrame(error=f"Realtime TTS request failed: {exc}", exception=exc)
+            )
+        finally:
+            await self._finish_audio_context(context)
+            now = time.perf_counter()
+            wall_ns = time.time_ns()
+            if context.attempt is not None:
+                context.attempt.ended_at = now
+                context.attempt.ended_wall_ns = wall_ns
+            if context.request is not None:
+                context.request.ended_at = now
+                context.request.ended_wall_ns = wall_ns
+            await self.stop_ttfb_metrics()
+            if self._context is context:
+                self._context = None
+
+    async def on_turn_context_completed(self):
+        context = self._context
+        await super().on_turn_context_completed()
+        # An LLM response with no text creates no audio context and needs no flush.
+        if self._context is context and context is not None:
+            self._context = None
+
+
 class RecordingMetricsProcessor(FrameProcessor):
     def __init__(self, state: CallState, *, llm_name: str, tts_name: str):
         super().__init__(name="recording-metrics")
@@ -1609,7 +2053,11 @@ async def run_call(
             system_instruction=config.system_prompt,
         ),
     )
-    tts = ModalTTSService(config, state)
+    tts = (
+        QwenRealtimeTTSService(config, state)
+        if config.tts_transport == "realtime_websocket"
+        else ModalTTSService(config, state)
+    )
     recorder = RecordingMetricsProcessor(state, llm_name=llm.name, tts_name=tts.name)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(LLMContext())
 
@@ -2202,11 +2650,17 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tts-url", default=os.getenv("TTS_URL"))
     parser.add_argument(
         "--tts-transport",
-        choices=("http", "websocket"),
+        choices=("http", "websocket", "realtime_websocket"),
         default=os.getenv("TTS_TRANSPORT", "http"),
-        help="Use one POST per turn or one persistent WebSocket per call",
+        help=(
+            "Use one POST per turn, one persistent ASGI WebSocket per call, or "
+            "Qwen's token-streaming realtime WebSocket"
+        ),
     )
-    parser.add_argument("--tts-bearer-token", default=os.getenv("TTS_BEARER_TOKEN"))
+    parser.add_argument(
+        "--tts-bearer-token",
+        default=os.getenv("TTS_BEARER_TOKEN") or os.getenv("TTS_API_KEY"),
+    )
     parser.add_argument("--tts-ref-audio", default=os.getenv("TTS_REF_AUDIO"))
     parser.add_argument("--tts-ref-text", default=os.getenv("TTS_REF_TEXT"))
     parser.add_argument("--tts-voice", default=os.getenv("TTS_VOICE"))
@@ -2257,6 +2711,13 @@ def validate_common_arguments(parser: argparse.ArgumentParser, args: argparse.Na
         parser.error("--tts-url or TTS_URL is required")
     if not args.llm_api_key:
         parser.error("--llm-api-key or OPENAI_API_KEY is required")
+    if args.tts_transport == "realtime_websocket" and not args.tts_voice:
+        parser.error("--tts-voice or TTS_VOICE is required for realtime_websocket")
+    if args.tts_transport == "realtime_websocket" and not args.tts_bearer_token:
+        parser.error(
+            "--tts-bearer-token, TTS_BEARER_TOKEN, or TTS_API_KEY is required "
+            "for realtime_websocket"
+        )
     if args.sample_rate < 1 or args.tts_source_sample_rate < 1:
         parser.error("sample rates must be positive")
     if args.tts_timeout_seconds <= 0 or args.turn_timeout_seconds <= 0:
