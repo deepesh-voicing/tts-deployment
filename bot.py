@@ -80,6 +80,7 @@ TAIL_THRESHOLDS_MS = (1_000, 2_000, 10_000, 30_000)
 BENCHMARK_THRESHOLD_KEYS = {
     "retry_rate_pct_max",
     "final_failure_rate_pct_max",
+    "turn_failure_rate_pct_max",
     "playable_ttfa_p95_ms_max",
     "playable_ttfa_p99_ms_max",
     "playable_ttfa_p99_9_ms_max",
@@ -87,11 +88,28 @@ BENCHMARK_THRESHOLD_KEYS = {
     "rtf_p95_max",
     "request_rate_achievement_pct_min",
 }
+# A nearest-rank percentile p is only distinct from the max with at least 1 / (1 - p) samples.
+THRESHOLD_MIN_SAMPLES = {
+    "playable_ttfa_p95_ms_max": 20,
+    "playable_ttfa_p99_ms_max": 100,
+    "playable_ttfa_p99_9_ms_max": 1_000,
+    "rtf_p95_max": 20,
+}
+REALTIME_SAMPLE_RATE = 8_000
+TURN_METRIC_NAMES = (
+    "llm_ttfb",
+    "llm_ttfat",
+    "llm_processing",
+    "text_aggregation",
+    "pipecat_tts_ttfa",
+    "tts_processing",
+)
 
 _TTS_SESSIONS_CREATED = 0
 _TTS_SESSIONS_CLOSED = 0
 _TTS_CONNECTORS_CLOSED = 0
 _TTS_SESSIONS_ACTIVE = 0
+_TTS_SOCKET_ADDRESSES: set[tuple[tuple[str, int], tuple[str, int]]] = set()
 
 
 def tts_session_counters() -> dict[str, int]:
@@ -101,6 +119,33 @@ def tts_session_counters() -> dict[str, int]:
         "connectors_closed": _TTS_CONNECTORS_CLOSED,
         "sessions_active": _TTS_SESSIONS_ACTIVE,
     }
+
+
+def tts_socket_addresses() -> set[tuple[tuple[str, int], tuple[str, int]]]:
+    """(local, remote) address pairs of every TTS socket opened by this process."""
+    return set(_TTS_SOCKET_ADDRESSES)
+
+
+def _remember_tts_socket(transport: Any) -> None:
+    get_extra_info = getattr(transport, "get_extra_info", None)
+    if not callable(get_extra_info):
+        return
+    sockname = get_extra_info("sockname")
+    peername = get_extra_info("peername")
+    if (
+        isinstance(sockname, tuple)
+        and isinstance(peername, tuple)
+        and len(sockname) >= 2
+        and len(peername) >= 2
+    ):
+        _TTS_SOCKET_ADDRESSES.add(
+            ((str(sockname[0]), int(sockname[1])), (str(peername[0]), int(peername[1])))
+        )
+
+
+def _remember_tts_response_socket(response: aiohttp.ClientResponse) -> None:
+    connection = getattr(response, "connection", None)
+    _remember_tts_socket(getattr(connection, "transport", None))
 
 
 async def _close_tracked_tts_session(session: aiohttp.ClientSession | None) -> None:
@@ -150,6 +195,7 @@ class ScenarioTurn:
 class Scenario:
     name: str
     turns: tuple[ScenarioTurn, ...]
+    weight: float = 1.0
 
 
 @dataclass
@@ -226,6 +272,9 @@ class TTSRequest:
     last_body_at: float | None = None
     last_body_wall_ns: int | None = None
     max_body_chunk_gap_seconds: float = 0.0
+    # Gaps that began after the full text reached the TTS; earlier gaps may be LLM pacing.
+    max_body_chunk_gap_after_text_seconds: float = 0.0
+    text_complete_at: float | None = None
     body_chunk_count: int = 0
     body_bytes: int = 0
     first_chunk_processing_seconds: float | None = None
@@ -277,6 +326,7 @@ class TurnState:
     number: int
     prompt: str
     started_at: float
+    started_wall_ns: int | None = None
     first_playable_at: float | None = None
     generated_at: float | None = None
     playback_ends_at: float | None = None
@@ -284,7 +334,11 @@ class TurnState:
     audio_bytes: int = 0
     initial_audio: bytearray = field(default_factory=bytearray)
     inter_audio_seconds: list[float] = field(default_factory=list)
+    # Underruns that began after the TTS had the full text, so the TTS is responsible.
     playback_gap_seconds: list[float] = field(default_factory=list)
+    # Underruns that began while the LLM was still streaming text to the TTS.
+    text_pending_playback_gap_seconds: list[float] = field(default_factory=list)
+    pipecat_metric_seconds: dict[str, list[float]] = field(default_factory=dict)
     tts_requests: list[TTSRequest] = field(default_factory=list)
     failure_component: str | None = None
     error: str | None = None
@@ -314,7 +368,12 @@ class CallState:
     turn_done: asyncio.Event = field(default_factory=asyncio.Event)
 
     def start_turn(self, prompt: str) -> TurnState:
-        turn = TurnState(number=len(self.turns) + 1, prompt=prompt, started_at=time.perf_counter())
+        turn = TurnState(
+            number=len(self.turns) + 1,
+            prompt=prompt,
+            started_at=time.perf_counter(),
+            started_wall_ns=time.time_ns(),
+        )
         self.turns.append(turn)
         self.current_turn = turn
         self.turn_done.clear()
@@ -352,10 +411,17 @@ class CallState:
                 target.second_body_at = now
                 target.second_body_wall_ns = wall_ns
             if target.last_body_at is not None:
-                target.max_body_chunk_gap_seconds = max(
-                    target.max_body_chunk_gap_seconds,
-                    now - target.last_body_at,
-                )
+                gap = now - target.last_body_at
+                target.max_body_chunk_gap_seconds = max(target.max_body_chunk_gap_seconds, gap)
+                if (
+                    target is request
+                    and request.text_complete_at is not None
+                    and target.last_body_at >= request.text_complete_at
+                ):
+                    request.max_body_chunk_gap_after_text_seconds = max(
+                        request.max_body_chunk_gap_after_text_seconds,
+                        gap,
+                    )
             target.last_body_at = now
             target.last_body_wall_ns = wall_ns
             target.body_chunk_count += 1
@@ -376,11 +442,19 @@ class CallState:
             self.append_silence(arrival - turn.started_at)
             turn.playback_ends_at = arrival
         else:
-            gap = max(0.0, arrival - turn.playback_ends_at)
+            gap_started_at = turn.playback_ends_at
+            gap = max(0.0, arrival - gap_started_at)
             # A silent priming chunk followed by a pause is pre-speech latency,
             # not an audible playback underrun.
             if turn.first_playable_at is not None:
-                turn.playback_gap_seconds.append(gap)
+                request = turn.tts_requests[-1] if turn.tts_requests else None
+                text_pending = request is not None and (
+                    request.text_complete_at is None or gap_started_at < request.text_complete_at
+                )
+                if text_pending:
+                    turn.text_pending_playback_gap_seconds.append(gap)
+                else:
+                    turn.playback_gap_seconds.append(gap)
             if gap:
                 silence = b"\x00\x00" * round(gap * self.sample_rate)
                 self.audio.extend(silence)
@@ -553,6 +627,7 @@ class ModalTTSService(TTSService):
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=2.0),
             ) as response:
+                _remember_tts_response_socket(response)
                 await response.read()
         except Exception as exc:  # noqa: BLE001 - the real TTS request remains the fallback
             logger.warning("TTS connection prewarm failed: {}: {}", type(exc).__name__, exc)
@@ -587,6 +662,7 @@ class ModalTTSService(TTSService):
             heartbeat=30.0,
             autoping=True,
         )
+        _remember_tts_socket(self._websocket)
         self._websocket_opened_at = time.perf_counter()
         self._websocket_opened_wall_ns = time.time_ns()
         return False
@@ -826,6 +902,7 @@ class ModalTTSService(TTSService):
     ) -> AsyncGenerator[Frame | None, None]:
         await self._await_prewarm()
         request = self._state.begin_tts_request(text, transport="websocket")
+        request.text_complete_at = request.started_at
         payload = self._tts_payload(text)
 
         try:
@@ -1006,6 +1083,7 @@ class ModalTTSService(TTSService):
 
         await self._await_prewarm()
         request = self._state.begin_tts_request(text, transport="http")
+        request.text_complete_at = request.started_at
         base_headers = {
             "Content-Type": "application/json",
             "X-Trace-Id": request.trace_id,
@@ -1047,6 +1125,7 @@ class ModalTTSService(TTSService):
                     attempt.response_headers_wall_ns = time.time_ns()
                     request.response_headers_at = attempt.response_headers_at
                     request.response_headers_wall_ns = attempt.response_headers_wall_ns
+                    _remember_tts_response_socket(response)
 
                     async with response:
                         attempt.modal_attempt_id = response.headers.get("X-Attempt-Id")
@@ -1350,6 +1429,7 @@ class QwenRealtimeTTSService(TTSService):
         if websocket is None or event is None:
             raise RuntimeError("Realtime WebSocket connection did not become ready")
 
+        _remember_tts_socket(websocket)
         self._websocket = websocket
         self._connection_started_at = started_at
         self._connection_ready_at = time.perf_counter()
@@ -1774,6 +1854,8 @@ class QwenRealtimeTTSService(TTSService):
                 context.pending_text = None
             elif not self.defer_final_text_for_flush:
                 await self._send_text(context, "", flush=True)
+            if context.request is not None:
+                context.request.text_complete_at = time.perf_counter()
             await self._finalize_turn_request(context)
             await asyncio.wait_for(
                 context.completed.wait(),
@@ -1861,6 +1943,7 @@ class ElevenLabsWebsocketTTSService(QwenRealtimeTTSService):
             headers={"xi-api-key": self._config.tts_bearer_token},
             autoping=True,
         )
+        _remember_tts_socket(websocket)
         self._websocket = websocket
         self._connection_started_at = started_at
         self._connection_ready_at = time.perf_counter()
@@ -2034,6 +2117,13 @@ class RecordingMetricsProcessor(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
+    def _record_metric(self, name: str, seconds: float) -> None:
+        getattr(self._state, f"{name}_seconds").append(seconds)
+        # Also keep it on the turn so reports can window metrics by turn start time.
+        turn = self._state.current_turn
+        if turn is not None:
+            turn.pipecat_metric_seconds.setdefault(name, []).append(seconds)
+
     def _capture_metrics(self, frame: MetricsFrame) -> None:
         for metric in frame.data:
             self._state.pipecat_metrics.append(
@@ -2046,18 +2136,18 @@ class RecordingMetricsProcessor(FrameProcessor):
             elif isinstance(metric, TTSUsageMetricsData):
                 self._state.tts_characters += metric.value
             elif isinstance(metric, TTFBMetricsData) and metric.processor == self._llm_name:
-                self._state.llm_ttfb_seconds.append(metric.value)
+                self._record_metric("llm_ttfb", metric.value)
             elif isinstance(metric, TTFATMetricsData) and metric.processor == self._llm_name:
-                self._state.llm_ttfat_seconds.append(metric.ttfat)
+                self._record_metric("llm_ttfat", metric.ttfat)
             elif isinstance(metric, TTFAMetricsData) and metric.processor == self._tts_name:
-                self._state.pipecat_tts_ttfa_seconds.append(metric.ttfa)
+                self._record_metric("pipecat_tts_ttfa", metric.ttfa)
             elif isinstance(metric, ProcessingMetricsData):
                 if metric.processor == self._llm_name:
-                    self._state.llm_processing_seconds.append(metric.value)
+                    self._record_metric("llm_processing", metric.value)
                 elif metric.processor == self._tts_name:
-                    self._state.tts_processing_seconds.append(metric.value)
+                    self._record_metric("tts_processing", metric.value)
             elif isinstance(metric, TextAggregationMetricsData):
-                self._state.text_aggregation_seconds.append(metric.value)
+                self._record_metric("text_aggregation", metric.value)
 
 
 def load_scenarios(path: Path) -> list[Scenario]:
@@ -2076,6 +2166,10 @@ def load_scenarios(path: Path) -> list[Scenario]:
             raise ValueError(f"Scenario name must be non-empty and unique: {name!r}")
         names.add(name)
 
+        weight = float(item.get("weight", 1.0))
+        if weight <= 0:
+            raise ValueError(f"Scenario {name!r} weight must be positive")
+
         raw_turns = item.get("turns")
         if not isinstance(raw_turns, list) or not raw_turns:
             raise ValueError(f"Scenario {name!r} needs at least one turn")
@@ -2086,9 +2180,86 @@ def load_scenarios(path: Path) -> list[Scenario]:
             wait = float(raw_turn.get("wait_after_seconds", 0.0))
             if wait < 0:
                 raise ValueError(f"wait_after_seconds cannot be negative in {name!r}")
+            _validate_prompt_placeholders(raw_turn["prompt"], name)
             turns.append(ScenarioTurn(prompt=raw_turn["prompt"], wait_after_seconds=wait))
-        scenarios.append(Scenario(name=name, turns=tuple(turns)))
+        scenarios.append(Scenario(name=name, turns=tuple(turns), weight=weight))
     return scenarios
+
+
+PLACEHOLDER_PATTERN = re.compile(r"\{([a-z_]+)(?::(\d+))?\}")
+PLACEHOLDER_KINDS = {"amount", "date", "digits", "email", "name", "phone", "ref", "time"}
+_PLACEHOLDER_NAMES = (
+    "Priya",
+    "Daniel",
+    "Aisha",
+    "Mateo",
+    "Mei",
+    "Oluwaseun",
+    "Sofia",
+    "Rahul",
+    "Grace",
+    "Tomasz",
+)
+_PLACEHOLDER_MONTHS = (
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+
+
+def _validate_prompt_placeholders(prompt: str, scenario_name: str) -> None:
+    for match in re.finditer(r"\{[^}]*\}", prompt):
+        placeholder = PLACEHOLDER_PATTERN.fullmatch(match.group(0))
+        if placeholder is None or placeholder.group(1) not in PLACEHOLDER_KINDS:
+            raise ValueError(
+                f"Unknown placeholder {match.group(0)!r} in {scenario_name!r}; "
+                f"use one of {', '.join(sorted(PLACEHOLDER_KINDS))}"
+            )
+        if placeholder.group(1) == "digits" and not placeholder.group(2):
+            raise ValueError(f"{{digits}} needs a length, like {{digits:4}}, in {scenario_name!r}")
+
+
+def _placeholder_value(kind: str, length: int | None, rng: random.Random) -> str:
+    if kind == "amount":
+        return f"${rng.randint(5, 4_999):,}.{rng.randint(0, 99):02d}"
+    if kind == "date":
+        return f"{rng.choice(_PLACEHOLDER_MONTHS)} {rng.randint(1, 28)}"
+    if kind == "digits":
+        return "".join(str(rng.randint(0, 9)) for _ in range(length or 1))
+    if kind == "email":
+        name = rng.choice(_PLACEHOLDER_NAMES).lower()
+        return f"{name}.{rng.randint(10, 99)}@example.com"
+    if kind == "name":
+        return rng.choice(_PLACEHOLDER_NAMES)
+    if kind == "phone":
+        return f"({rng.randint(201, 989)}) 555-{rng.randint(0, 9_999):04d}"
+    if kind == "ref":
+        letters = "".join(rng.choice("ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(2))
+        return f"{letters}-{rng.randint(10_000, 99_999)}"
+    if kind == "time":
+        return f"{rng.randint(1, 12)}:{rng.choice(('00', '15', '30', '45'))} {rng.choice(('AM', 'PM'))}"
+    raise ValueError(f"Unknown placeholder kind {kind!r}")
+
+
+def expand_prompt_placeholders(prompt: str, rng: random.Random) -> str:
+    """Fill {amount}, {phone}, {digits:4} and similar with fresh random values."""
+    return PLACEHOLDER_PATTERN.sub(
+        lambda match: _placeholder_value(
+            match.group(1),
+            int(match.group(2)) if match.group(2) else None,
+            rng,
+        ),
+        prompt,
+    )
 
 
 def load_benchmark_config(path: Path) -> dict[str, Any]:
@@ -2308,9 +2479,31 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
         request.realtime_segments,
         "websocket_receive_to_vllm_send_ms",
     )
+    wall_rtf = (
+        round(request_ms / audio_duration_ms, 6)
+        if request_ms is not None and audio_duration_ms > 0
+        else None
+    )
+    segment_generation_ms = _segment_metric_values(request.realtime_segments, "generation_ms")
+    if (
+        segment_generation_ms
+        and len(segment_generation_ms) == len(request.realtime_segments)
+        and audio_duration_ms > 0
+    ):
+        # Streaming-text transports keep the request open while the LLM is still
+        # sending text, so only server generation time measures TTS speed.
+        rtf = round(sum(segment_generation_ms) / audio_duration_ms, 6)
+        rtf_source = "server_generation"
+    elif request.transport in {"http", "websocket"}:
+        rtf = wall_rtf
+        rtf_source = "client_request_wall"
+    else:
+        rtf = wall_rtf
+        rtf_source = "client_request_wall_includes_text_streaming"
     return {
         "trace_id": request.trace_id,
         "transport": request.transport,
+        "text_characters": len(request.text),
         "bot_number": request.bot_number,
         "turn_number": request.turn_number,
         "modal_trace_id": request.modal_trace_id,
@@ -2332,7 +2525,16 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
         "first_body_ms": first_body_ms,
         "second_body_ms": _elapsed_ms(request.started_at, request.second_body_at),
         "last_body_ms": _elapsed_ms(request.started_at, request.last_body_at),
+        "text_complete_ms": (
+            _elapsed_ms(request.started_at, request.text_complete_at)
+            if request.text_complete_at is not None
+            else None
+        ),
         "max_body_chunk_gap_ms": round(request.max_body_chunk_gap_seconds * 1000, 3),
+        "max_body_chunk_gap_after_text_ms": round(
+            request.max_body_chunk_gap_after_text_seconds * 1000,
+            3,
+        ),
         "body_completion_gap_ms": (
             round((request.ended_at - request.last_body_at) * 1000, 3)
             if request.ended_at is not None and request.last_body_at is not None
@@ -2419,11 +2621,9 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
         "request_ms": request_ms,
         "audio_bytes": request.audio_bytes,
         "audio_duration_ms": round(audio_duration_ms, 3),
-        "rtf": (
-            round(request_ms / audio_duration_ms, 6)
-            if request_ms is not None and audio_duration_ms > 0
-            else None
-        ),
+        "rtf": rtf,
+        "rtf_source": rtf_source,
+        "wall_rtf": wall_rtf,
         "attempt_count": len(request.attempts),
         "retry_count": max(0, len(request.attempts) - 1),
         "segment_queue_ms": _segment_metric_values(
@@ -2539,11 +2739,31 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
         for request in request_reports
         if request["first_playable_ttfa_ms"] is not None
     ]
+    all_requests_playable = all(
+        request.first_playable_at is not None for request in turn.tts_requests
+    )
+    failed = turn.error is not None or turn.first_playable_at is None or not all_requests_playable
+    failure_component = turn.failure_component
+    if failed and failure_component is None:
+        failure_component = "tts" if turn.tts_requests else "unknown"
+    if turn.tts_requests and all_requests_playable:
+        tts_outcome = "ok"
+    elif turn.tts_requests or failure_component in {"tts", "transport"}:
+        tts_outcome = "failed"
+    else:
+        tts_outcome = "not_attempted"
     return {
         "turn": turn.number,
         "prompt": turn.prompt,
+        "started_wall_ns": turn.started_wall_ns,
+        "failed": failed,
+        "tts_outcome": tts_outcome,
         "spoken_text": [request.text for request in turn.tts_requests],
         "tts_requests": request_reports,
+        **{
+            f"{name}_ms": _milliseconds(turn.pipecat_metric_seconds.get(name, []))
+            for name in TURN_METRIC_NAMES
+        },
         "end_to_end_ttfa_ms": (
             round((turn.first_playable_at - turn.started_at) * 1000, 3)
             if turn.first_playable_at is not None
@@ -2568,6 +2788,7 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
             for request in request_reports
             if request["request_ms"] is not None
         ],
+        "tts_text_characters": [request["text_characters"] for request in request_reports],
         "websocket_send_ms": [
             request["websocket_send_ms"]
             for request in request_reports
@@ -2644,10 +2865,11 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
         ],
         "inter_audio_ms": _milliseconds(turn.inter_audio_seconds),
         "playback_gap_ms": _milliseconds(turn.playback_gap_seconds),
+        "text_pending_playback_gap_ms": _milliseconds(turn.text_pending_playback_gap_seconds),
         "rtf": [request["rtf"] for request in request_reports if request["rtf"] is not None],
         "audio_bytes": turn.audio_bytes,
         "audio_duration_ms": round(turn.audio_bytes / (sample_rate * 2) * 1000, 3),
-        "failure_component": turn.failure_component,
+        "failure_component": failure_component,
         "error": turn.error,
     }
 
@@ -2723,9 +2945,11 @@ async def run_call(
                 turn.error = frame.error
 
     state.started_at = time.perf_counter()
+    started_wall_ns = time.time_ns()
     deadline = state.started_at + duration_seconds
     runner_task = asyncio.create_task(runner.run())
     turn_index = 0
+    turn_timed_out = False
 
     try:
         while turn_index == 0 or time.perf_counter() < deadline:
@@ -2760,6 +2984,7 @@ async def run_call(
                     turn.failure_component = "pipeline"
                 state.errors.append(error)
                 state.finish_turn()
+                turn_timed_out = True
                 break
 
             if turn.playback_ends_at is not None:
@@ -2776,9 +3001,15 @@ async def run_call(
                 state.append_silence(wait_seconds)
                 await asyncio.sleep(wait_seconds)
     finally:
-        await worker.queue_frame(EndFrame())
+        if turn_timed_out:
+            # A graceful EndFrame would queue behind the stuck LLM or TTS call and hold
+            # this call open for up to the TTS timeout; cancel closes the sockets now.
+            await worker.cancel(reason="turn timeout")
+        else:
+            await worker.queue_frame(EndFrame())
         await runner_task
         state.ended_at = time.perf_counter()
+        ended_wall_ns = time.time_ns()
 
     output_dir.mkdir(parents=True, exist_ok=True)
     recording_path = output_dir / f"call_{call_id:04d}.wav"
@@ -2796,6 +3027,9 @@ async def run_call(
         "scenario": scenario.name,
         "requested_duration_seconds": duration_seconds,
         "actual_call_seconds": call_seconds,
+        "started_wall_ns": started_wall_ns,
+        "ended_wall_ns": ended_wall_ns,
+        "turn_timed_out": turn_timed_out,
         "recording": str(recording_path),
         "turn_count": len(turns),
         "tts_request_count": len(tts_requests),
@@ -2808,6 +3042,7 @@ async def run_call(
             turn.failure_component == "transport" for turn in state.turns
         ),
         "tts_failure_count": failed_tts_requests,
+        "failed_turn_count": sum(turn["failed"] for turn in turns),
         "success": bool(turns) and not state.errors and failed_tts_requests == 0,
         "end_to_end_ttfa_ms": [
             turn["end_to_end_ttfa_ms"] for turn in turns if turn["end_to_end_ttfa_ms"] is not None
@@ -2821,6 +3056,7 @@ async def run_call(
         "tts_ttfa_ms": [value for turn in turns for value in turn["tts_ttfa_ms"]],
         "playable_gate_ms": [value for turn in turns for value in turn["playable_gate_ms"]],
         "tts_request_ms": [value for turn in turns for value in turn["tts_request_ms"]],
+        "tts_text_characters": [value for turn in turns for value in turn["tts_text_characters"]],
         "websocket_send_ms": [value for turn in turns for value in turn["websocket_send_ms"]],
         "client_send_to_websocket_receive_ms": [
             value for turn in turns for value in turn["client_send_to_websocket_receive_ms"]
@@ -2869,6 +3105,9 @@ async def run_call(
         ],
         "inter_audio_ms": [value for turn in turns for value in turn["inter_audio_ms"]],
         "playback_gap_ms": [value for turn in turns for value in turn["playback_gap_ms"]],
+        "text_pending_playback_gap_ms": [
+            value for turn in turns for value in turn["text_pending_playback_gap_ms"]
+        ],
         "rtf": [value for turn in turns for value in turn["rtf"]],
         "pipecat_tts_ttfa_ms": _milliseconds(state.pipecat_tts_ttfa_seconds),
         "llm_ttfb_ms": _milliseconds(state.llm_ttfb_seconds),
@@ -2898,10 +3137,10 @@ async def run_call(
     return report
 
 
-def _flatten(calls: list[dict[str, Any]], field_name: str) -> list[float]:
+def _flatten(items: list[dict[str, Any]], field_name: str) -> list[float]:
     values: list[float] = []
-    for call in calls:
-        value = call[field_name]
+    for item in items:
+        value = item.get(field_name)
         if isinstance(value, list):
             values.extend(item for item in value if item is not None)
         elif value is not None:
@@ -2940,12 +3179,145 @@ def _distribution(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def _distribution_with_failures(
+    values: list[float],
+    failure_count: int,
+) -> dict[str, float | int | None]:
+    """Percentiles where each failure ranks above every success.
+
+    A percentile that lands on a failure is None, so a threshold on it fails.
+    """
+    ordered = sorted(values)
+    count = len(ordered) + failure_count
+
+    def nearest_rank(percentile: float) -> float | None:
+        if not count:
+            return None
+        index = max(0, math.ceil(percentile * count) - 1)
+        return round(ordered[index], 6) if index < len(ordered) else None
+
+    return {
+        "count": count,
+        "failures": failure_count,
+        "p50": nearest_rank(0.50),
+        "p95": nearest_rank(0.95),
+        "p99": nearest_rank(0.99),
+        "p99_9": nearest_rank(0.999),
+        "max": round(ordered[-1], 6) if ordered and not failure_count else None,
+    }
+
+
 def _percentage(numerator: float, denominator: float) -> float | None:
     return round(100 * numerator / denominator, 6) if denominator else None
 
 
-def _request_reports(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [request for call in calls for turn in call["turns"] for request in turn["tts_requests"]]
+def _request_reports(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [request for turn in turns for request in turn.get("tts_requests", [])]
+
+
+def _turn_in_window(turn: dict[str, Any], window_ns: tuple[int, int] | None) -> bool:
+    started_wall_ns = turn.get("started_wall_ns")
+    if window_ns is None or started_wall_ns is None:
+        return True
+    return window_ns[0] <= started_wall_ns < window_ns[1]
+
+
+def _tts_ttfa_population(turns: list[dict[str, Any]]) -> tuple[list[float], int]:
+    """Per-turn playable TTFA for turns that reached the TTS, plus TTS failure count."""
+    values = []
+    failures = 0
+    for turn in turns:
+        outcome = turn.get("tts_outcome")
+        if outcome == "ok":
+            values.append(turn["first_playable_ttfa_ms"][0])
+        elif outcome == "failed":
+            failures += 1
+    return values, failures
+
+
+def _tts_in_flight_report(
+    requests: list[dict[str, Any]],
+    window_ns: tuple[int, int] | None,
+) -> dict[str, Any]:
+    """Time-weighted count of TTS requests open at once, from the client's view."""
+    return _overlap_report(
+        [
+            (
+                (request.get("client_wall_time_ns") or {}).get("request_start"),
+                (request.get("client_wall_time_ns") or {}).get("request_end"),
+            )
+            for request in requests
+        ],
+        window_ns,
+    )
+
+
+def _active_calls_report(
+    calls: list[dict[str, Any]],
+    window_ns: tuple[int, int] | None,
+) -> dict[str, Any]:
+    """Time-weighted count of calls in progress at once."""
+    return _overlap_report(
+        [(call.get("started_wall_ns"), call.get("ended_wall_ns")) for call in calls],
+        window_ns,
+    )
+
+
+def _overlap_report(
+    raw_intervals: list[tuple[int | None, int | None]],
+    window_ns: tuple[int, int] | None,
+) -> dict[str, Any]:
+    """Time-weighted distribution of how many intervals overlap, clipped to the window."""
+    intervals = []
+    for start, end in raw_intervals:
+        if start is None or end is None:
+            continue
+        if window_ns is not None:
+            start, end = max(start, window_ns[0]), min(end, window_ns[1])
+        if end > start:
+            intervals.append((start, end))
+    if window_ns is not None:
+        span_start, span_end = window_ns
+    elif intervals:
+        span_start = min(start for start, _ in intervals)
+        span_end = max(end for _, end in intervals)
+    else:
+        span_start = span_end = 0
+    empty = {"mean": None, "p50": None, "p95": None, "p99": None, "max": None}
+    if span_end <= span_start:
+        return empty
+
+    events = sorted(
+        [(start, 1) for start, _ in intervals] + [(end, -1) for _, end in intervals],
+        key=lambda event: (event[0], event[1]),
+    )
+    time_at_level: dict[int, int] = {}
+    level = 0
+    peak = 0
+    previous = span_start
+    for timestamp, delta in events:
+        time_at_level[level] = time_at_level.get(level, 0) + timestamp - previous
+        previous = timestamp
+        level += delta
+        peak = max(peak, level)
+    time_at_level[level] = time_at_level.get(level, 0) + span_end - previous
+    total = span_end - span_start
+
+    def time_percentile(percentile: float) -> int:
+        elapsed = 0
+        for value in sorted(time_at_level):
+            elapsed += time_at_level[value]
+            if elapsed >= percentile * total:
+                return value
+        return peak
+
+    return {
+        "mean": round(sum(value * weight for value, weight in time_at_level.items()) / total, 3),
+        "p50": time_percentile(0.50),
+        "p95": time_percentile(0.95),
+        "p99": time_percentile(0.99),
+        "max": peak,
+    }
 
 
 def _request_population(requests: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2970,13 +3342,17 @@ def _request_population(requests: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _tail_breaches(values: list[float]) -> dict[str, dict[str, float | int | None]]:
+def _tail_breaches(
+    values: list[float],
+    failure_count: int = 0,
+) -> dict[str, dict[str, float | int | None]]:
+    """Failures count as breaches of every threshold."""
     return {
         f"over_{threshold_ms}_ms": {
-            "count": sum(value > threshold_ms for value in values),
+            "count": sum(value > threshold_ms for value in values) + failure_count,
             "rate_pct": _percentage(
-                sum(value > threshold_ms for value in values),
-                len(values),
+                sum(value > threshold_ms for value in values) + failure_count,
+                len(values) + failure_count,
             ),
         }
         for threshold_ms in TAIL_THRESHOLDS_MS
@@ -2992,9 +3368,11 @@ def _is_transport_stall(request: dict[str, Any]) -> bool:
         for error in attempt_errors
     )
     trailing_gap_ms = request["body_completion_gap_ms"] or 0.0
+    # Ignore gaps that began while the LLM was still streaming text to a realtime TTS.
+    body_gap_ms = request.get("max_body_chunk_gap_after_text_ms", request["max_body_chunk_gap_ms"])
     return (
         retryable_transport_error
-        or request["max_body_chunk_gap_ms"] > TRANSPORT_STALL_THRESHOLD_SECONDS * 1000
+        or body_gap_ms > TRANSPORT_STALL_THRESHOLD_SECONDS * 1000
         or trailing_gap_ms > TRANSPORT_STALL_THRESHOLD_SECONDS * 1000
     )
 
@@ -3022,8 +3400,12 @@ def _runtime_report(observations: dict[str, Any] | None) -> dict[str, Any] | Non
     )
     tcp_start = observations.get("tcp_connections_start")
     tcp_end = observations.get("tcp_connections_end")
+    tts_tcp_end = observations.get("tts_tcp_connections_end")
     tcp_cleanup_passed = None
-    if (
+    if isinstance(tts_tcp_end, dict) and "error" not in tts_tcp_end:
+        # Only sockets the TTS services opened; LLM client pools are not a TTS leak.
+        tcp_cleanup_passed = tts_tcp_end.get("ESTABLISHED", 0) == 0
+    elif (
         isinstance(tcp_start, dict)
         and isinstance(tcp_end, dict)
         and "error" not in tcp_start
@@ -3060,6 +3442,8 @@ def _runtime_report(observations: dict[str, Any] | None) -> dict[str, Any] | Non
         "process_tcp_connection_cleanup": {
             "start": tcp_start,
             "end": tcp_end,
+            "tts_sockets_tracked": observations.get("tts_sockets_tracked"),
+            "tts_end": tts_tcp_end,
             "passed": tcp_cleanup_passed,
         },
     }
@@ -3068,6 +3452,7 @@ def _runtime_report(observations: dict[str, Any] | None) -> dict[str, Any] | Non
 def _threshold_report(
     configured: dict[str, float],
     observed: dict[str, float | None],
+    sample_counts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     checks = {}
     for name, threshold in configured.items():
@@ -3076,16 +3461,28 @@ def _threshold_report(
         passed = value is not None and (
             value >= threshold if comparator == ">=" else value <= threshold
         )
-        checks[name] = {
+        check = {
             "observed": value,
             "threshold": threshold,
             "comparator": comparator,
             "passed": passed,
         }
+        min_samples = THRESHOLD_MIN_SAMPLES.get(name)
+        sample_count = (sample_counts or {}).get(name)
+        if min_samples is not None and sample_count is not None:
+            check["samples"] = sample_count
+            check["min_samples"] = min_samples
+            if sample_count < min_samples:
+                check["passed"] = False
+                check["reason"] = f"needs at least {min_samples} samples, got {sample_count}"
+        checks[name] = check
+    evaluated = bool(checks)
     return {
         "configured": configured,
         "checks": checks,
-        "passed": all(check["passed"] for check in checks.values()),
+        "evaluated": evaluated,
+        # None means no thresholds are configured, so the run was not judged at all.
+        "passed": all(check["passed"] for check in checks.values()) if evaluated else None,
     }
 
 
@@ -3093,7 +3490,7 @@ def build_load_report(
     config: BotConfig,
     calls: list[dict[str, Any]],
     *,
-    concurrency: int,
+    concurrency: int | None,
     duration_seconds: float,
     phase_wall_seconds: float,
     modal_average_containers: float | None,
@@ -3101,8 +3498,9 @@ def build_load_report(
     thresholds: dict[str, float] | None = None,
     harness_error_count: int = 0,
     runtime_observations: dict[str, Any] | None = None,
+    steady_state_window_ns: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
-    metric_fields = (
+    turn_metric_fields = (
         "end_to_end_ttfa_ms",
         "llm_ttfb_ms",
         "llm_ttfat_ms",
@@ -3116,6 +3514,7 @@ def build_load_report(
         "playable_gate_ms",
         "pipecat_tts_ttfa_ms",
         "tts_request_ms",
+        "tts_text_characters",
         "websocket_send_ms",
         "client_send_to_websocket_receive_ms",
         "client_send_complete_to_websocket_receive_ms",
@@ -3135,67 +3534,104 @@ def build_load_report(
         "tts_processing_ms",
         "inter_audio_ms",
         "playback_gap_ms",
+        "text_pending_playback_gap_ms",
         "rtf",
-        "actual_call_seconds",
     )
-    distributions = {field: _distribution(_flatten(calls, field)) for field in metric_fields}
+    all_turns = [turn for call in calls for turn in call["turns"]]
+    # Only turns that started while every call slot was active; ramp-up and drain
+    # turns ran at lower load and would dilute the percentiles and rates.
+    turns = [turn for turn in all_turns if _turn_in_window(turn, steady_state_window_ns)]
+    window_seconds = (
+        (steady_state_window_ns[1] - steady_state_window_ns[0]) / 1e9
+        if steady_state_window_ns is not None
+        else None
+    )
+    distributions = {field: _distribution(_flatten(turns, field)) for field in turn_metric_fields}
+    distributions["actual_call_seconds"] = _distribution(_flatten(calls, "actual_call_seconds"))
+    ttfa_values, tts_turn_failures = _tts_ttfa_population(turns)
+    ttfa_including_failures = _distribution_with_failures(ttfa_values, tts_turn_failures)
+    distributions["first_playable_ttfa_ms_including_failures"] = ttfa_including_failures
     runtime = _runtime_report(runtime_observations)
     if runtime is not None:
         distributions["event_loop_lag_ms"] = runtime["event_loop_lag_ms"]
     total_call_minutes = sum(call["actual_call_seconds"] for call in calls) / 60
-    requests = _request_reports(calls)
+    all_requests = _request_reports(all_turns)
+    requests = _request_reports(turns)
     retry_requests = [request for request in requests if request["retry_count"] > 0]
     no_retry_requests = [request for request in requests if request["retry_count"] == 0]
     recovered_retries = sum(
         request["retry_count"] > 0 and request["first_playable_ttfa_ms"] is not None
-        for request in requests
+        for request in all_requests
     )
-    transport_stalls = sum(_is_transport_stall(request) for request in requests)
+    all_transport_stalls = sum(_is_transport_stall(request) for request in all_requests)
+    window_transport_stalls = sum(_is_transport_stall(request) for request in requests)
     failed_calls = sum(not call["success"] for call in calls)
     total_call_sessions = len(calls) + harness_error_count
     total_tts_requests = sum(call["tts_request_count"] for call in calls)
-    playback_gaps = _flatten(calls, "playback_gap_ms")
-    turns = [turn for call in calls for turn in call["turns"]]
+    failed_window_requests = sum(request["first_playable_ttfa_ms"] is None for request in requests)
+    failed_turns = sum(bool(turn.get("failed")) for turn in turns)
+    tts_turn_count = len(ttfa_values) + tts_turn_failures
+    playback_gaps = _flatten(turns, "playback_gap_ms")
+    text_pending_gaps = _flatten(turns, "text_pending_playback_gap_ms")
     material_playback_gaps = [
         gap for gap in playback_gaps if gap > PLAYBACK_GAP_REPORT_THRESHOLD_MS
     ]
     turns_with_playback_gaps = sum(
-        any(gap > PLAYBACK_GAP_REPORT_THRESHOLD_MS for gap in turn["playback_gap_ms"])
+        any(gap > PLAYBACK_GAP_REPORT_THRESHOLD_MS for gap in turn.get("playback_gap_ms", []))
         for turn in turns
     )
-    achieved_request_rate_rps = (
-        total_tts_requests / phase_wall_seconds if phase_wall_seconds > 0 else None
+    turns_with_text_pending_gaps = sum(
+        any(
+            gap > PLAYBACK_GAP_REPORT_THRESHOLD_MS
+            for gap in turn.get("text_pending_playback_gap_ms", [])
+        )
+        for turn in turns
     )
+    rate_seconds = window_seconds if window_seconds is not None else phase_wall_seconds
+    achieved_request_rate_rps = len(requests) / rate_seconds if rate_seconds > 0 else None
     request_rate_achievement_pct = (
         100 * achieved_request_rate_rps / intended_request_rate_rps
         if achieved_request_rate_rps is not None and intended_request_rate_rps is not None
+        else None
+    )
+    rtf_requests = [request for request in requests if request["rtf"] is not None]
+    rtf_audio_total = sum(request["audio_duration_ms"] for request in rtf_requests)
+    weighted_rtf = (
+        sum(request["rtf"] * request["audio_duration_ms"] for request in rtf_requests)
+        / rtf_audio_total
+        if rtf_audio_total
         else None
     )
     request_time_total = sum(
         request["request_ms"] for request in requests if request["request_ms"] is not None
     )
     audio_time_total = sum(request["audio_duration_ms"] for request in requests)
-    weighted_rtf = request_time_total / audio_time_total if audio_time_total else None
+    weighted_wall_rtf = request_time_total / audio_time_total if audio_time_total else None
 
     rates = {
-        "retry_rate_pct": _percentage(len(retry_requests), total_tts_requests),
+        "retry_rate_pct": _percentage(len(retry_requests), len(requests)),
+        # Per call: a call fails if any turn in it hit an error.
         "final_failure_rate_pct": _percentage(
             failed_calls + harness_error_count,
             total_call_sessions,
         ),
-        "final_tts_failure_rate_pct": _percentage(
-            sum(call["failed_tts_request_count"] for call in calls),
-            total_tts_requests,
-        ),
+        "turn_failure_rate_pct": _percentage(failed_turns, len(turns)),
+        "tts_turn_failure_rate_pct": _percentage(tts_turn_failures, tts_turn_count),
+        "final_tts_failure_rate_pct": _percentage(failed_window_requests, len(requests)),
         "playback_gap_rate_pct": _percentage(turns_with_playback_gaps, len(turns)),
-        "transport_stall_rate_pct": _percentage(transport_stalls, total_tts_requests),
+        "text_pending_playback_gap_rate_pct": _percentage(
+            turns_with_text_pending_gaps,
+            len(turns),
+        ),
+        "transport_stall_rate_pct": _percentage(window_transport_stalls, len(requests)),
     }
     threshold_observed = {
         "retry_rate_pct_max": rates["retry_rate_pct"],
         "final_failure_rate_pct_max": rates["final_failure_rate_pct"],
-        "playable_ttfa_p95_ms_max": distributions["first_playable_ttfa_ms"]["p95"],
-        "playable_ttfa_p99_ms_max": distributions["first_playable_ttfa_ms"]["p99"],
-        "playable_ttfa_p99_9_ms_max": distributions["first_playable_ttfa_ms"]["p99_9"],
+        "turn_failure_rate_pct_max": rates["turn_failure_rate_pct"],
+        "playable_ttfa_p95_ms_max": ttfa_including_failures["p95"],
+        "playable_ttfa_p99_ms_max": ttfa_including_failures["p99"],
+        "playable_ttfa_p99_9_ms_max": ttfa_including_failures["p99_9"],
         "playback_gap_rate_pct_max": rates["playback_gap_rate_pct"],
         "rtf_p95_max": distributions["rtf"]["p95"],
         "request_rate_achievement_pct_min": (
@@ -3204,11 +3640,27 @@ def build_load_report(
             else None
         ),
     }
-    threshold_results = _threshold_report(thresholds or {}, threshold_observed)
+    threshold_sample_counts = {
+        "playable_ttfa_p95_ms_max": ttfa_including_failures["count"],
+        "playable_ttfa_p99_ms_max": ttfa_including_failures["count"],
+        "playable_ttfa_p99_9_ms_max": ttfa_including_failures["count"],
+        "rtf_p95_max": distributions["rtf"]["count"],
+    }
+    threshold_results = _threshold_report(
+        thresholds or {},
+        threshold_observed,
+        threshold_sample_counts,
+    )
     connection_cleanup_passed = runtime is None or (
         runtime["tts_connection_cleanup"]["passed"]
         and runtime["process_tcp_connection_cleanup"]["passed"] is not False
     )
+    if threshold_results["passed"] is False or not connection_cleanup_passed:
+        passed: bool | None = False
+    elif threshold_results["evaluated"]:
+        passed = True
+    else:
+        passed = None
 
     llm_cost_values = [call["llm_cost_usd"] for call in calls if call["llm_cost_usd"] is not None]
     llm_cost = sum(llm_cost_values) if len(llm_cost_values) == len(calls) else None
@@ -3239,6 +3691,41 @@ def build_load_report(
         "tts_attempts": sum(call["tts_attempt_count"] for call in calls),
         "tts_retries": sum(call["tts_retry_count"] for call in calls),
         "failed_tts_attempts": sum(call["failed_tts_attempt_count"] for call in calls),
+        "failed_turns": sum(bool(turn.get("failed")) for turn in all_turns),
+        "steady_state": {
+            "applied": steady_state_window_ns is not None,
+            "window_start_wall_ns": (
+                steady_state_window_ns[0] if steady_state_window_ns is not None else None
+            ),
+            "window_end_wall_ns": (
+                steady_state_window_ns[1] if steady_state_window_ns is not None else None
+            ),
+            "window_seconds": window_seconds,
+            "turns_in_window": len(turns),
+            "turns_total": len(all_turns),
+            "tts_requests_in_window": len(requests),
+            "note": (
+                "summary, request_populations, tail_breaches, rates, playback_gaps, rtf, "
+                "request_rate and tts_in_flight cover turns that started while every call "
+                "slot was active. Top-level counts, failure_breakdown and cost cover the "
+                "whole phase."
+                if steady_state_window_ns is not None
+                else "No steady-state window was given, so every metric covers the whole phase."
+            ),
+        },
+        "tts_in_flight": {
+            **_tts_in_flight_report(all_requests, steady_state_window_ns),
+            "call_slots": concurrency,
+            "note": (
+                "Time-weighted count of TTS requests open at once, from first text sent to "
+                "last audio received. call_slots counts simulated calls, most of which are "
+                "idle (LLM, playback or user wait) at any moment."
+            ),
+        },
+        "active_calls": {
+            **_active_calls_report(calls, steady_state_window_ns),
+            "note": "Time-weighted count of simulated calls in progress at once.",
+        },
         "summary": distributions,
         "request_populations": {
             "all": _request_population(requests),
@@ -3246,13 +3733,7 @@ def build_load_report(
             "no_retry": _request_population(no_retry_requests),
         },
         "tail_breaches": {
-            "first_playable_ttfa_ms": _tail_breaches(
-                [
-                    request["first_playable_ttfa_ms"]
-                    for request in requests
-                    if request["first_playable_ttfa_ms"] is not None
-                ]
-            ),
+            "first_playable_ttfa_ms": _tail_breaches(ttfa_values, tts_turn_failures),
             "tts_request_ms": _tail_breaches(
                 [request["request_ms"] for request in requests if request["request_ms"] is not None]
             ),
@@ -3262,7 +3743,8 @@ def build_load_report(
             "final_tts_failures": sum(call["failed_tts_request_count"] for call in calls),
             "recovered_tts_retries": recovered_retries,
             "transport_failures": sum(call.get("transport_failure_count", 0) for call in calls),
-            "transport_stalls": transport_stalls,
+            "transport_stalls": all_transport_stalls,
+            "failed_turns": sum(bool(turn.get("failed")) for turn in all_turns),
             "failed_calls": failed_calls,
             "harness_failures": harness_error_count,
         },
@@ -3278,10 +3760,18 @@ def build_load_report(
             "events_over_100_ms": sum(gap > 100 for gap in playback_gaps),
             "events_over_500_ms": sum(gap > 500 for gap in playback_gaps),
             "events_over_1000_ms": sum(gap > 1_000 for gap in playback_gaps),
+            "text_pending_events_over_threshold": sum(
+                gap > PLAYBACK_GAP_REPORT_THRESHOLD_MS for gap in text_pending_gaps
+            ),
+            "text_pending_affected_turns": turns_with_text_pending_gaps,
         },
         "rtf": {
             "weighted": round(weighted_rtf, 6) if weighted_rtf is not None else None,
             "distribution": distributions["rtf"],
+            "sources": sorted({request.get("rtf_source", "unknown") for request in rtf_requests}),
+            "weighted_client_wall": (
+                round(weighted_wall_rtf, 6) if weighted_wall_rtf is not None else None
+            ),
         },
         "request_rate": {
             "achieved_rps": (
@@ -3289,6 +3779,7 @@ def build_load_report(
                 if achieved_request_rate_rps is not None
                 else None
             ),
+            "measured_over_seconds": rate_seconds,
             "intended_rps": intended_request_rate_rps,
             "achievement_pct": (
                 round(request_rate_achievement_pct, 6)
@@ -3298,7 +3789,7 @@ def build_load_report(
         },
         "runtime": runtime,
         "thresholds": threshold_results,
-        "passed": threshold_results["passed"] and connection_cleanup_passed,
+        "passed": passed,
         "cost": {
             "llm_usd": llm_cost,
             "modal_usd": modal_cost,
@@ -3321,7 +3812,21 @@ def build_load_report(
         "playback_gap_note": (
             "Playback gap is a zero-buffer simulated underrun after the first audible frame, "
             "not measured speaker output. Raw durations include tiny scheduling jitter; "
-            "playback_gap_rate_pct is the percentage of turns with a gap over 20 ms."
+            "playback_gap_rate_pct is the percentage of turns with a gap over 20 ms. "
+            "playback_gap_ms only counts underruns that began after the TTS had the full "
+            "text; underruns that began while the LLM was still streaming text are in "
+            "text_pending_playback_gap_ms."
+        ),
+        "rtf_note": (
+            "rtf is generation time divided by audio duration. Realtime transports use the "
+            "server's per-segment generation_ms, because the client request stays open while "
+            "the LLM streams text. HTTP and WebSocket use client request wall time. "
+            "weighted_client_wall is the old request_ms / audio_ms ratio for comparison."
+        ),
+        "ttfa_note": (
+            "Thresholds on playable TTFA use first_playable_ttfa_ms_including_failures: one "
+            "sample per turn that reached the TTS, where a failed turn ranks above every "
+            "success. A percentile that lands on a failure is null and fails its threshold."
         ),
         "tts_timeline_note": (
             "response_headers_ms is HTTP response headers, first_body_ms is the first arbitrary "
@@ -3371,12 +3876,12 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         default=int(os.getenv("TTS_SOURCE_SAMPLE_RATE", "8000")),
     )
     parser.add_argument(
-        "--tts-timeout-seconds", type=float, default=float(os.getenv("TTS_TIMEOUT_SECONDS", "180"))
+        "--tts-timeout-seconds", type=float, default=float(os.getenv("TTS_TIMEOUT_SECONDS", "20"))
     )
     parser.add_argument(
         "--turn-timeout-seconds",
         type=float,
-        default=float(os.getenv("TURN_TIMEOUT_SECONDS", "240")),
+        default=float(os.getenv("TURN_TIMEOUT_SECONDS", "30")),
     )
     parser.add_argument(
         "--system-prompt",
@@ -3414,6 +3919,13 @@ def validate_common_arguments(parser: argparse.ArgumentParser, args: argparse.Na
         parser.error(f"--tts-bearer-token is required for {args.tts_transport}")
     if args.sample_rate < 1 or args.tts_source_sample_rate < 1:
         parser.error("sample rates must be positive")
+    if args.tts_transport in realtime_transports and args.sample_rate != REALTIME_SAMPLE_RATE:
+        # These services always emit pcm_8000; any other rate mislabels the audio
+        # and skews audio duration, RTF and the recorded WAV.
+        parser.error(
+            f"--sample-rate must be {REALTIME_SAMPLE_RATE} for {args.tts_transport}, "
+            f"got {args.sample_rate}"
+        )
     if args.tts_timeout_seconds <= 0 or args.turn_timeout_seconds <= 0:
         parser.error("timeouts must be positive")
     for name in ("llm_input_usd_per_1m", "llm_output_usd_per_1m", "modal_usd_per_second"):
@@ -3472,6 +3984,18 @@ async def async_main(args: argparse.Namespace) -> Path:
     if scenario is None:
         available = ", ".join(item.name for item in scenarios)
         raise ValueError(f"Unknown scenario {args.scenario!r}; available: {available}")
+    rng = random.Random()
+    scenario = Scenario(
+        name=scenario.name,
+        turns=tuple(
+            ScenarioTurn(
+                prompt=expand_prompt_placeholders(turn.prompt, rng),
+                wait_after_seconds=turn.wait_after_seconds,
+            )
+            for turn in scenario.turns
+        ),
+        weight=scenario.weight,
+    )
 
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     output_dir = args.output_dir / f"{timestamp}_{_slug(config.model)}_{_slug(scenario.name)}"

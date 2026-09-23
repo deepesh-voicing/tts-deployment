@@ -1,6 +1,9 @@
 import asyncio
 import base64
+import itertools
 import json
+import random
+import re
 import threading
 import time
 import wave
@@ -13,6 +16,7 @@ from aiohttp import web
 from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame
 
 import bot as bot_module
+import capacity_sweep
 import load_test as load_test_module
 from bot import (
     BotConfig,
@@ -26,7 +30,7 @@ from bot import (
     run_call,
     tts_session_counters,
 )
-from load_test import _apply_wav_retention, _call_start_delay, _mixed_scenario, async_main
+from load_test import _apply_wav_retention, _call_start_delay, async_main
 
 SAMPLE_RATE = 8_000
 FIRST_CHUNK_SAMPLES = 304
@@ -144,6 +148,9 @@ async def _run_local_pipeline(
     wait_after_seconds: float = 0.0,
     realtime_idle_timeout_seconds: float | None = None,
     realtime_events: list[dict] | None = None,
+    realtime_hangs_after_flush: bool = False,
+    tts_timeout_seconds: float = 5,
+    turn_timeout_seconds: float = 5,
 ):
     tts_post_count = 0
 
@@ -343,6 +350,10 @@ async def _run_local_pipeline(
                 continue
             if event["type"] == "text":
                 text_events.append(event)
+                if event["flush"] and realtime_hangs_after_flush:
+                    # Accept the text but never answer, like a stuck GPU worker.
+                    await websocket.receive()
+                    break
                 if event["flush"]:
                     context_id = event["context_id"]
                     assert [item["text"] for item in text_events] == [
@@ -489,8 +500,8 @@ async def _run_local_pipeline(
         tts_bearer_token="test-token",
         sample_rate=8000,
         tts_source_sample_rate=24000,
-        tts_timeout_seconds=5,
-        turn_timeout_seconds=5,
+        tts_timeout_seconds=tts_timeout_seconds,
+        turn_timeout_seconds=turn_timeout_seconds,
         system_prompt="Be exact.",
         llm_model="test-model",
         llm_api_key="test-key",
@@ -529,11 +540,13 @@ async def _run_local_pipeline(
     return config, results
 
 
-def test_scenarios_file_has_ten_valid_scenarios():
+def test_scenarios_file_has_weighted_valid_scenarios():
     scenarios = load_scenarios(Path("scenarios.yaml"))
 
-    assert len(scenarios) == 10
+    assert len(scenarios) == 17
     assert all(scenario.turns for scenario in scenarios)
+    assert sum(scenario.weight for scenario in scenarios) == 100
+    assert load_test_module.load_call_timing(Path("scenarios.yaml")).user_turn_p95_ratio == 2.5
 
 
 def test_timed_call_records_audio_and_metrics_without_turn_wavs(tmp_path, monkeypatch):
@@ -754,6 +767,9 @@ def test_realtime_websocket_streams_llm_chunks_and_records_audio(tmp_path):
     assert all(timeline["segment_queue_ms"] == [0.5] for timeline in timelines)
     assert all(timeline["segment_first_audio_ms"] == [3.25] for timeline in timelines)
     assert all(timeline["segment_generation_ms"] == [20.0] for timeline in timelines)
+    assert all(timeline["rtf_source"] == "server_generation" for timeline in timelines)
+    assert all(timeline["rtf"] == round(20.0 / 900.0, 6) for timeline in timelines)
+    assert all(timeline["text_complete_ms"] is not None for timeline in timelines)
     assert all(timeline["upstream_pcm_first_to_second_chunk_ms"] == [4.0] for timeline in timelines)
     assert all(timeline["upstream_pcm_mean_chunk_gap_ms"] == [5.0] for timeline in timelines)
     assert all(timeline["upstream_pcm_max_chunk_gap_ms"] == [6.0] for timeline in timelines)
@@ -1238,7 +1254,9 @@ def test_runtime_report_tracks_memory_and_connection_cleanup(tmp_path):
     assert report["runtime"]["tts_connection_cleanup"]["unclosed_sessions"] == 0
     assert report["runtime"]["tts_connection_cleanup"]["passed"] is True
     assert report["runtime"]["process_tcp_connection_cleanup"]["passed"] is True
-    assert report["passed"] is True
+    # Clean connections alone do not make a run pass when no thresholds are configured.
+    assert report["thresholds"]["evaluated"] is False
+    assert report["passed"] is None
 
 
 def test_call_start_delay_spans_ramp_evenly():
@@ -1250,29 +1268,75 @@ def test_call_start_delay_spans_ramp_evenly():
     ]
 
 
-def test_mixed_scenario_rotates_all_scenarios_from_call_offset():
+def test_call_plan_is_reproducible_weighted_and_covers_the_call():
     scenarios = [
-        Scenario(name="first", turns=(ScenarioTurn(prompt="first-1", wait_after_seconds=1),)),
         Scenario(
-            name="second",
-            turns=(
-                ScenarioTurn(prompt="second-1", wait_after_seconds=2),
-                ScenarioTurn(prompt="second-2", wait_after_seconds=3),
-            ),
+            name="common",
+            turns=(ScenarioTurn(prompt="Say {amount} on {date}.", wait_after_seconds=4),),
+            weight=99,
         ),
-        Scenario(name="third", turns=(ScenarioTurn(prompt="third-1", wait_after_seconds=4),)),
+        Scenario(
+            name="rare",
+            turns=(ScenarioTurn(prompt="Say rare.", wait_after_seconds=4),),
+            weight=1,
+        ),
     ]
+    timing = load_test_module.CallTiming()
 
-    mixed = _mixed_scenario(scenarios, call_id=2)
+    plan = load_test_module._call_plan(scenarios, random.Random("seed"), 600, timing)
+    again = load_test_module._call_plan(scenarios, random.Random("seed"), 600, timing)
 
-    assert mixed.name == "mixed-start-second"
-    assert [turn.prompt for turn in mixed.turns] == [
-        "second-1",
-        "second-2",
-        "third-1",
-        "first-1",
-    ]
-    assert [turn.wait_after_seconds for turn in mixed.turns] == [2, 3, 4, 1]
+    assert plan == again
+    assert sum(turn.wait_after_seconds for turn in plan.turns) >= 600
+    assert plan.name.split("+").count("common") > 0.9 * len(plan.turns)
+    assert all("{" not in turn.prompt for turn in plan.turns)
+    assert len({turn.prompt for turn in plan.turns}) > 1
+    waits = [turn.wait_after_seconds for turn in plan.turns]
+    assert len(set(waits)) > 0.9 * len(waits)
+    assert all(timing.user_turn_min_seconds <= wait <= timing.user_turn_max_seconds for wait in waits)
+
+
+def test_user_turn_waits_follow_median_and_p95():
+    timing = load_test_module.CallTiming(user_turn_p95_ratio=2.5, user_turn_max_seconds=1_000)
+    rng = random.Random(1)
+
+    waits = sorted(load_test_module._user_turn_seconds(4.0, timing, rng) for _ in range(20_000))
+
+    assert waits[len(waits) // 2] == pytest.approx(4.0, rel=0.05)
+    assert waits[int(len(waits) * 0.95)] == pytest.approx(10.0, rel=0.07)
+
+
+def test_fixed_median_overrides_scripted_waits_and_ratio_one_disables_jitter():
+    timing = load_test_module.CallTiming(user_turn_median_seconds=3.0, user_turn_p95_ratio=1)
+
+    assert load_test_module._user_turn_seconds(7.0, timing, random.Random()) == 3.0
+
+
+def test_call_timing_rejects_unknown_keys(tmp_path):
+    path = tmp_path / "scenarios.yaml"
+    path.write_text("call_timing:\n  think_time: 3\n")
+
+    with pytest.raises(ValueError, match="think_time"):
+        load_test_module.load_call_timing(path)
+
+
+def test_placeholders_expand_and_unknown_ones_are_rejected(tmp_path):
+    rng = random.Random(5)
+    text = bot_module.expand_prompt_placeholders(
+        "{amount} {date} {digits:6} {email} {name} {phone} {ref} {time}",
+        rng,
+    )
+    assert "{" not in text
+    assert re.search(r"\$[\d,]+\.\d\d", text)
+    assert re.search(r"\b\d{6}\b", text)
+    assert re.search(r"\(\d{3}\) 555-\d{4}", text)
+
+    path = tmp_path / "scenarios.yaml"
+    path.write_text(
+        "scenarios:\n  - name: bad\n    turns:\n      - prompt: 'Your code is {pin}'\n"
+    )
+    with pytest.raises(ValueError, match="pin"):
+        load_scenarios(path)
 
 
 def test_wav_retention_removes_unselected_recording(tmp_path, monkeypatch):
@@ -1347,6 +1411,8 @@ def test_call_slots_replace_finished_calls_until_soak_deadline(tmp_path, monkeyp
         output_dir=tmp_path,
         wav_retention_percent=100.0,
         modal_average_containers=None,
+        arrival_rate_per_minute=None,
+        seed=1,
     )
 
     report_path, passed = asyncio.run(async_main(args))
@@ -1365,3 +1431,557 @@ def test_call_slots_replace_finished_calls_until_soak_deadline(tmp_path, monkeyp
     assert "tcp_connections_end" in runtime
     assert "tts_sessions_start" in runtime
     assert "tts_sessions_end" in runtime
+
+
+def _report_config():
+    return SimpleNamespace(
+        model="qwen3-tts-1.7b",
+        tts_url="https://example.test",
+        tts_transport="realtime_websocket",
+        sample_rate=8_000,
+        tts_source_sample_rate=8_000,
+        llm_model="test-llm",
+        modal_usd_per_second=None,
+    )
+
+
+def _synthetic_turn(ttfa_ms, *, started_wall_ns=None):
+    return {
+        "started_wall_ns": started_wall_ns,
+        "failed": ttfa_ms is None,
+        "tts_outcome": "ok" if ttfa_ms is not None else "failed",
+        "first_playable_ttfa_ms": [] if ttfa_ms is None else [ttfa_ms],
+        "tts_requests": [],
+        "playback_gap_ms": [],
+    }
+
+
+def _synthetic_call(turns):
+    return {
+        "call_id": 1,
+        "turns": turns,
+        "turn_count": len(turns),
+        "actual_call_seconds": 60.0,
+        "success": all(not turn["failed"] for turn in turns),
+        "tts_request_count": 0,
+        "failed_tts_request_count": 0,
+        "tts_attempt_count": 0,
+        "tts_retry_count": 0,
+        "failed_tts_attempt_count": 0,
+        "llm_cost_usd": None,
+    }
+
+
+def _build_synthetic_report(turns, **kwargs):
+    return build_load_report(
+        _report_config(),
+        [_synthetic_call(turns)],
+        concurrency=1,
+        duration_seconds=60,
+        phase_wall_seconds=60,
+        modal_average_containers=None,
+        **kwargs,
+    )
+
+
+def test_failed_turns_count_against_ttfa_percentiles():
+    turns = [_synthetic_turn(100.0) for _ in range(97)] + [_synthetic_turn(None)] * 3
+
+    report = _build_synthetic_report(
+        turns,
+        thresholds={"playable_ttfa_p95_ms_max": 200, "playable_ttfa_p99_ms_max": 200},
+    )
+
+    including_failures = report["summary"]["first_playable_ttfa_ms_including_failures"]
+    assert including_failures["count"] == 100
+    assert including_failures["failures"] == 3
+    assert including_failures["p95"] == 100.0
+    # The 99th turn is a failure, so p99 is unknown and its threshold fails.
+    assert including_failures["p99"] is None
+    checks = report["thresholds"]["checks"]
+    assert checks["playable_ttfa_p95_ms_max"]["passed"] is True
+    assert checks["playable_ttfa_p99_ms_max"]["passed"] is False
+    assert report["passed"] is False
+    assert report["rates"]["turn_failure_rate_pct"] == 3.0
+    assert report["rates"]["tts_turn_failure_rate_pct"] == 3.0
+    assert report["tail_breaches"]["first_playable_ttfa_ms"]["over_1000_ms"]["count"] == 3
+
+
+def test_percentile_threshold_needs_enough_samples():
+    turns = [_synthetic_turn(100.0) for _ in range(50)]
+
+    report = _build_synthetic_report(
+        turns,
+        thresholds={"playable_ttfa_p95_ms_max": 200, "playable_ttfa_p99_ms_max": 200},
+    )
+
+    checks = report["thresholds"]["checks"]
+    assert checks["playable_ttfa_p95_ms_max"]["passed"] is True
+    assert checks["playable_ttfa_p99_ms_max"]["passed"] is False
+    assert checks["playable_ttfa_p99_ms_max"]["reason"] == "needs at least 100 samples, got 50"
+
+
+def test_configured_thresholds_that_hold_pass_the_run():
+    turns = [_synthetic_turn(100.0) for _ in range(20)]
+
+    report = _build_synthetic_report(turns, thresholds={"playable_ttfa_p95_ms_max": 200})
+
+    assert report["thresholds"]["evaluated"] is True
+    assert report["passed"] is True
+
+
+def test_steady_state_window_excludes_ramp_and_drain_turns():
+    window = (1_000, 2_000)
+    turns = (
+        [_synthetic_turn(900.0, started_wall_ns=500) for _ in range(5)]
+        + [_synthetic_turn(100.0, started_wall_ns=1_500) for _ in range(20)]
+        + [_synthetic_turn(800.0, started_wall_ns=2_000) for _ in range(5)]
+    )
+
+    report = _build_synthetic_report(turns, steady_state_window_ns=window)
+
+    assert report["steady_state"]["applied"] is True
+    assert report["steady_state"]["turns_in_window"] == 20
+    assert report["steady_state"]["turns_total"] == 30
+    assert report["summary"]["first_playable_ttfa_ms_including_failures"]["p95"] == 100.0
+    assert report["request_rate"]["measured_over_seconds"] == pytest.approx(1e-6)
+
+
+def test_tts_in_flight_is_time_weighted_within_window():
+    requests = [
+        {"client_wall_time_ns": {"request_start": 0, "request_end": 10}},
+        {"client_wall_time_ns": {"request_start": 5, "request_end": 15}},
+        {"client_wall_time_ns": {"request_start": 18, "request_end": 40}},
+    ]
+
+    in_flight = bot_module._tts_in_flight_report(requests, (0, 20))
+
+    # 5 ns at one, 5 at two, 5 at one, 3 idle, then the third request clipped to 2 ns.
+    assert in_flight["mean"] == pytest.approx((5 + 10 + 5 + 2) / 20, abs=1e-3)
+    assert in_flight["p50"] == 1
+    assert in_flight["p99"] == 2
+    assert in_flight["max"] == 2
+
+
+def test_realtime_rtf_uses_server_generation_time():
+    request = bot_module.TTSRequest(
+        trace_id="trace",
+        bot_number=1,
+        turn_number=1,
+        text="hello",
+        sample_rate=8_000,
+        started_at=0.0,
+        started_wall_ns=0,
+        transport="realtime_websocket",
+        ended_at=3.0,
+        audio_bytes=32_000,
+        realtime_segments=[{"generation_ms": 300.0}, {"generation_ms": 200.0}],
+    )
+
+    report = bot_module._tts_request_report(request)
+
+    assert report["audio_duration_ms"] == 2_000.0
+    assert report["rtf"] == 0.25
+    assert report["rtf_source"] == "server_generation"
+    # The client-side value includes the time the LLM spent streaming text.
+    assert report["wall_rtf"] == 1.5
+
+
+def test_body_gaps_before_text_is_complete_are_not_transport_stalls():
+    request = bot_module.TTSRequest(
+        trace_id="trace",
+        bot_number=1,
+        turn_number=1,
+        text="hello",
+        sample_rate=8_000,
+        started_at=0.0,
+        started_wall_ns=0,
+        transport="realtime_websocket",
+        text_complete_at=5.0,
+    )
+    attempt = bot_module.TTSAttempt(attempt_id="a", number=1, started_at=0.0, started_wall_ns=0)
+
+    with patch("bot.time.perf_counter", side_effect=[1.0, 3.0, 6.0, 6.5]):
+        for _ in range(4):
+            CallState.received_tts_body(request, attempt, 320)
+
+    assert request.max_body_chunk_gap_seconds == pytest.approx(3.0)
+    assert request.max_body_chunk_gap_after_text_seconds == pytest.approx(0.5)
+    report = bot_module._tts_request_report(request)
+    assert bot_module._is_transport_stall(report) is False
+
+
+def test_playback_gap_while_llm_streams_is_attributed_to_text():
+    state = _call_state()
+    request = state.begin_tts_request("hello", transport="realtime_websocket")
+
+    with patch("bot.time.perf_counter", side_effect=[1.0, 1.5]):
+        state.record_audio(_audio_frame(audible=True))
+        state.record_audio(_audio_frame(audible=True))
+    request.text_complete_at = 1.52
+    with patch("bot.time.perf_counter", side_effect=[2.5]):
+        state.record_audio(_audio_frame(audible=True))
+
+    turn = state.current_turn
+    assert turn is not None
+    assert turn.text_pending_playback_gap_seconds == [pytest.approx(0.462)]
+    assert turn.playback_gap_seconds == [pytest.approx(0.962)]
+
+
+def test_tcp_cleanup_only_counts_tts_sockets():
+    def runtime(tts_end):
+        return bot_module._runtime_report(
+            {
+                "tcp_connections_start": {},
+                "tcp_connections_end": {"ESTABLISHED": 55},
+                "tts_tcp_connections_end": tts_end,
+                "tts_sessions_start": {},
+                "tts_sessions_end": {},
+            }
+        )
+
+    assert runtime({})["process_tcp_connection_cleanup"]["passed"] is True
+    assert runtime({"ESTABLISHED": 1})["process_tcp_connection_cleanup"]["passed"] is False
+
+
+def test_tcp_connection_counts_filter_to_tracked_sockets():
+    def connection(local_port, remote_ip, status="ESTABLISHED"):
+        return SimpleNamespace(
+            laddr=SimpleNamespace(ip="10.0.0.2", port=local_port),
+            raddr=SimpleNamespace(ip=remote_ip, port=443),
+            status=status,
+        )
+
+    process = SimpleNamespace(
+        net_connections=lambda kind: [
+            connection(50_000, "1.1.1.1"),
+            connection(50_001, "2.2.2.2"),
+            SimpleNamespace(
+                laddr=SimpleNamespace(ip="0.0.0.0", port=80), raddr=(), status="LISTEN"
+            ),
+        ]
+    )
+    tts_sockets = {(("10.0.0.2", 50_000), ("1.1.1.1", 443))}
+
+    assert load_test_module._tcp_connection_counts(process) == {"ESTABLISHED": 2, "LISTEN": 1}
+    assert load_test_module._tcp_connection_counts(process, tts_sockets) == {"ESTABLISHED": 1}
+
+
+def test_realtime_transport_requires_8khz_output(monkeypatch):
+    monkeypatch.setattr(load_test_module, "load_dotenv", lambda: None)
+    argv = [
+        "--model",
+        "qwen3-tts-1.7b",
+        "--tts-url",
+        "https://example.test",
+        "--tts-transport",
+        "realtime_websocket",
+        "--tts-voice",
+        "Vivian",
+        "--tts-bearer-token",
+        "token",
+        "--llm-api-key",
+        "key",
+        "--concurrency",
+        "1",
+    ]
+
+    assert load_test_module.parse_args([*argv, "--sample-rate", "8000"]).sample_rate == 8_000
+    with pytest.raises(SystemExit):
+        load_test_module.parse_args([*argv, "--sample-rate", "16000"])
+
+
+def test_steady_state_window_spans_last_slot_start_to_first_slot_deadline():
+    assert load_test_module._steady_state_window_ns(1_000, 900, 180) == (
+        1_000 + 180 * 10**9,
+        1_000 + 900 * 10**9,
+    )
+    assert load_test_module._steady_state_window_ns(1_000, 60, 60) is None
+
+
+def test_slot_replaces_call_that_ends_early_without_rotation(tmp_path, monkeypatch):
+    requested_durations = []
+    captured_report_kwargs = {}
+
+    async def fake_run_call(config, *, call_id, scenario, duration_seconds, output_dir):
+        requested_durations.append(duration_seconds)
+        # Simulate a call that breaks off after a turn timeout.
+        await asyncio.sleep(min(0.02, duration_seconds))
+        return {"call_id": call_id, "success": False}
+
+    monkeypatch.setattr(
+        load_test_module,
+        "config_from_args",
+        lambda args: SimpleNamespace(model="qwen3-tts-1.7b"),
+    )
+    monkeypatch.setattr(
+        load_test_module,
+        "load_scenarios",
+        lambda path: [Scenario(name="test", turns=())],
+    )
+    monkeypatch.setattr(load_test_module, "run_call", fake_run_call)
+
+    def fake_build_load_report(config, calls, **kwargs):
+        captured_report_kwargs.update(kwargs)
+        return {
+            "calls": calls,
+            "summary": {},
+            "playback_gaps": {},
+            "cost": {},
+            "failure_breakdown": {},
+            "thresholds": {},
+            "passed": None,
+        }
+
+    monkeypatch.setattr(load_test_module, "build_load_report", fake_build_load_report)
+    args = SimpleNamespace(
+        scenarios=Path("scenarios.yaml"),
+        concurrency=1,
+        duration_seconds=0.075,
+        call_duration_seconds=None,
+        ramp_seconds=0.0,
+        output_dir=tmp_path,
+        wav_retention_percent=100.0,
+        modal_average_containers=None,
+        arrival_rate_per_minute=None,
+        seed=1,
+    )
+
+    report_path, passed = asyncio.run(async_main(args))
+    report = json.loads(report_path.read_text())
+
+    assert passed is None
+    assert len(report["calls"]) >= 3
+    assert requested_durations[0] == pytest.approx(0.075, abs=0.01)
+    window = captured_report_kwargs["steady_state_window_ns"]
+    assert window[1] - window[0] == round(0.075 * 1e9)
+
+
+def test_turn_timeout_cancels_the_call_instead_of_waiting_for_the_tts(tmp_path):
+    started_at = time.perf_counter()
+    _, results = asyncio.run(
+        _run_local_pipeline(
+            tmp_path,
+            tts_transport="realtime_websocket",
+            realtime_hangs_after_flush=True,
+            tts_timeout_seconds=30,
+            turn_timeout_seconds=0.5,
+        )
+    )
+    elapsed_seconds = time.perf_counter() - started_at
+
+    result = results[0]
+    assert result["turn_timed_out"] is True
+    assert result["turns"][0]["failed"] is True
+    assert result["turns"][0]["tts_outcome"] == "failed"
+    # Draining gracefully would have waited out the 30 s TTS timeout.
+    assert elapsed_seconds < 10
+    assert result["started_wall_ns"] < result["ended_wall_ns"]
+
+
+def _fake_load_test(monkeypatch, run_call_seconds=None):
+    started = []
+    captured_report_kwargs = {}
+
+    async def fake_run_call(config, *, call_id, scenario, duration_seconds, output_dir):
+        started.append((time.perf_counter(), call_id, duration_seconds, scenario))
+        await asyncio.sleep(duration_seconds if run_call_seconds is None else run_call_seconds)
+        return {"call_id": call_id, "success": True}
+
+    def fake_build_load_report(config, calls, **kwargs):
+        captured_report_kwargs.update(kwargs)
+        return {
+            "calls": calls,
+            "summary": {},
+            "playback_gaps": {},
+            "cost": {},
+            "failure_breakdown": {},
+            "thresholds": {},
+            "passed": None,
+        }
+
+    monkeypatch.setattr(
+        load_test_module,
+        "config_from_args",
+        lambda args: SimpleNamespace(model="qwen3-tts-1.7b"),
+    )
+    monkeypatch.setattr(
+        load_test_module,
+        "load_scenarios",
+        lambda path: [
+            Scenario(
+                name="test",
+                turns=(ScenarioTurn(prompt="Say {amount}.", wait_after_seconds=3),),
+            )
+        ],
+    )
+    monkeypatch.setattr(load_test_module, "run_call", fake_run_call)
+    monkeypatch.setattr(load_test_module, "build_load_report", fake_build_load_report)
+    return started, captured_report_kwargs
+
+
+def test_poisson_mode_starts_calls_at_random_times(tmp_path, monkeypatch):
+    started, captured_report_kwargs = _fake_load_test(monkeypatch)
+    args = SimpleNamespace(
+        scenarios=Path("scenarios.yaml"),
+        concurrency=None,
+        arrival_rate_per_minute=6_000,
+        duration_seconds=0.3,
+        call_duration_seconds=0.05,
+        ramp_seconds=None,
+        output_dir=tmp_path,
+        wav_retention_percent=100.0,
+        modal_average_containers=None,
+        seed=42,
+    )
+
+    report_path, _ = asyncio.run(async_main(args))
+    report = json.loads(report_path.read_text())
+
+    # 100 calls/s for 0.3 s averages 30 arrivals.
+    assert 10 <= len(started) <= 60
+    assert report["arrival"]["mode"] == "poisson"
+    assert report["arrival"]["calls_arrived"] == len(started)
+    assert report["seed"] == 42
+    assert captured_report_kwargs["concurrency"] is None
+    gaps = [later[0] - earlier[0] for earlier, later in itertools.pairwise(started)]
+    assert max(gaps) > 2 * min(gaps)
+    call_durations = [duration for _, _, duration, _ in started]
+    assert len(set(call_durations)) == len(call_durations)
+    assert all("{" not in turn.prompt for *_, scenario in started for turn in scenario.turns)
+    # Warmup is the p95 call length (0.05 s x 2.0), so the window starts 0.1 s in.
+    window = captured_report_kwargs["steady_state_window_ns"]
+    assert window[1] - window[0] == round(0.2 * 1e9)
+
+
+def test_parse_args_defaults_to_poisson_and_validates_modes(monkeypatch):
+    monkeypatch.setattr(load_test_module, "load_dotenv", lambda: None)
+    base = ["--model", "qwen3-tts-1.7b", "--tts-url", "https://example.test"]
+    base += ["--llm-api-key", "key"]
+
+    default = load_test_module.parse_args(base)
+    closed = load_test_module.parse_args([*base, "--concurrency", "4", "--duration-seconds", "900"])
+    short = load_test_module.parse_args([*base, "--concurrency", "4", "--duration-seconds", "100"])
+
+    assert default.concurrency is None
+    assert default.arrival_rate_per_minute == 15
+    assert default.call_duration_seconds == 180
+    assert default.duration_seconds == 1_800
+    assert default.ramp_seconds is None
+    assert closed.ramp_seconds == 60
+    assert closed.arrival_rate_per_minute is None
+    assert short.ramp_seconds == 25
+    assert load_test_module.parse_args([*base, "--concurrency", "4"]).duration_seconds == 180
+    with pytest.raises(SystemExit):
+        load_test_module.parse_args(
+            [*base, "--concurrency", "4", "--arrival-rate-per-minute", "20"]
+        )
+    with pytest.raises(SystemExit):
+        load_test_module.parse_args([*base, "--ramp-seconds", "10"])
+    # 180 s median calls have a 360 s warmup, so a 300 s phase would never reach full load.
+    with pytest.raises(SystemExit):
+        load_test_module.parse_args([*base, "--duration-seconds", "300"])
+
+
+def _fake_phase_report(tmp_path, rate, passed):
+    report = {
+        "summary": {
+            "first_playable_ttfa_ms_including_failures": {
+                "count": 1_000,
+                "p50": 300.0,
+                "p95": 400.0 + rate,
+                "p99": 500.0 + rate,
+            },
+            "event_loop_lag_ms": {"p99": 3.0},
+        },
+        "arrival": {"expected_active_calls": rate * 3.3},
+        "active_calls": {"mean": rate * 3.2, "max": int(rate * 4)},
+        "tts_in_flight": {"mean": rate / 2, "p99": int(rate)},
+        "rates": {"turn_failure_rate_pct": 0.0, "playback_gap_rate_pct": 0.01},
+        "rtf": {"weighted": 0.24},
+        "thresholds": {
+            "checks": {"playable_ttfa_p99_ms_max": {"passed": passed is not False}},
+        },
+        "passed": passed,
+    }
+    path = tmp_path / f"summary_{rate:g}.json"
+    path.write_text(json.dumps(report))
+    return path
+
+
+def _run_fake_sweep(tmp_path, monkeypatch, argv, outcomes):
+    monkeypatch.setattr(load_test_module, "load_dotenv", lambda: None)
+    phases = []
+
+    async def fake_async_main(args):
+        phases.append(args)
+        rate = args.arrival_rate_per_minute
+        return _fake_phase_report(tmp_path, rate, outcomes[rate]), outcomes[rate]
+
+    monkeypatch.setattr(load_test_module, "async_main", fake_async_main)
+    base = [
+        "--model",
+        "qwen3-tts-1.7b",
+        "--tts-url",
+        "https://example.test",
+        "--llm-api-key",
+        "key",
+        "--output-dir",
+        str(tmp_path),
+        "--cooldown-seconds",
+        "0",
+    ]
+    sweep_args, load_test_argv = capacity_sweep.parse_args([*base, *argv])
+    sweep = asyncio.run(capacity_sweep.run_sweep(sweep_args, load_test_argv))
+    return sweep, phases
+
+
+def test_sweep_runs_rates_in_order_and_stops_at_first_failure(tmp_path, monkeypatch, capsys):
+    outcomes = {12.0: True, 15.0: True, 18.0: False, 21.0: False}
+
+    sweep, phases = _run_fake_sweep(tmp_path, monkeypatch, ["--rates", "18,12,21,15"], outcomes)
+
+    assert [args.arrival_rate_per_minute for args in phases] == [12, 15, 18]
+    assert len({args.seed for args in phases}) == 1
+    assert all(args.output_dir == phases[0].output_dir for args in phases)
+    assert phases[0].output_dir.name.endswith("_qwen3-tts-1-7b_sweep")
+    assert sweep["capacity_rate_per_minute"] == 15
+    assert [row["passed"] for row in sweep["phases"]] == [True, True, False]
+    assert sweep["phases"][2]["failed_checks"] == ["playable_ttfa_p99_ms_max"]
+    saved = json.loads((phases[0].output_dir / "sweep.json").read_text())
+    assert saved["capacity_rate_per_minute"] == 15
+    output = capsys.readouterr().out
+    assert "| calls/min |" in output
+    assert "Capacity: 15 calls/min" in output
+
+
+def test_sweep_keep_going_runs_every_rate(tmp_path, monkeypatch):
+    outcomes = {12.0: True, 15.0: False, 18.0: True}
+
+    sweep, phases = _run_fake_sweep(
+        tmp_path, monkeypatch, ["--rates", "12,15,18", "--keep-going"], outcomes
+    )
+
+    assert len(phases) == 3
+    # A pass above a failing rate does not count as capacity.
+    assert sweep["capacity_rate_per_minute"] == 12
+
+
+def test_sweep_without_thresholds_is_not_judged(tmp_path, monkeypatch, capsys):
+    outcomes = {12.0: None, 15.0: None}
+
+    sweep, phases = _run_fake_sweep(tmp_path, monkeypatch, ["--rates", "12,15"], outcomes)
+
+    assert len(phases) == 2
+    assert sweep["capacity_rate_per_minute"] is None
+    output = capsys.readouterr().out
+    assert "not judged" in output
+
+
+def test_sweep_rejects_load_shape_arguments():
+    with pytest.raises(SystemExit):
+        capacity_sweep.parse_args(["--rates", "12", "--concurrency", "4"])
+    with pytest.raises(SystemExit):
+        capacity_sweep.parse_args(["--rates", "12", "--arrival-rate-per-minute=20"])
+    with pytest.raises(SystemExit):
+        capacity_sweep.parse_args(["--rates", "0,12"])

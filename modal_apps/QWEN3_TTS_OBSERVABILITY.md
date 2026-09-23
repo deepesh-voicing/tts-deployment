@@ -226,82 +226,48 @@ observed connection lifetime above 150 seconds.
 
 ### Realtime partial-text WebSocket timing
 
-The isolated `/v1/text-to-speech/{voice_id}/stream-input` route emits one
-`segment_done` timing record per Qwen segment. The load-test artifact retains
-every record and promotes the first segment into the request latency summary.
+The isolated `/v1/text-to-speech/{voice_id}/stream-input` route forwards each
+partial text message to vLLM-Omni v0.29.0rc1's native text-input WebSocket with
+`split_granularity="clause"`. vLLM decides clause boundaries and processes the
+resulting TTS segments in order. This wrapper keeps authentication, the public
+control events, and one 24 kHz → 8 kHz PCM resampling pass. `flush:true` maps to
+vLLM `input.done`.
 
 | Field | Unit/meaning |
 |---|---|
-| `trigger_reason` | Why the segment was released: `punctuation`, `first_segment_fallback`, `first_segment_deadline`, `hard_max`, or `flush` |
-| `text_characters` | Number of characters submitted in this Qwen segment |
-| `first_text_receive_to_segment_enqueue_ms` | Server-monotonic time from the first buffered text for the segment through its release into the synthesis queue |
-| `websocket_receive_to_vllm_send_ms` | Server-monotonic time from the last contributing message through local vLLM submission; includes remaining deadline wait and segment queueing |
-| `segment_enqueue_to_vllm_send_ms` | Server-monotonic time from segment enqueue through local vLLM submission; retained in each `realtime_segments` record |
-| `vllm_send_to_first_24khz_audio_ms` | Local vLLM submission through receipt of its first native 24 kHz PCM chunk |
-| `first_24khz_audio_to_first_8khz_pcm_sent_ms` | First native chunk through resampling and completion of the first public 8 kHz WebSocket send |
-| `client_send_to_first_pcm_ms` | Client-monotonic send start through receipt of the first public PCM frame |
-| `queue_ms` | Segment enqueue through start of segment synthesis |
-| `first_audio_ms` | Segment synthesis start through the first resampled chunk becoming available to send |
-| `generation_ms` | Segment synthesis start through the completed upstream stream |
-| `upstream_pcm_first_to_second_chunk_ms` | Gap between the first two native 24 kHz HTTP PCM chunks; this is transport-visible packet cadence, not Stage 0 codec-token ITL |
-| `upstream_pcm_mean_chunk_gap_ms` | Mean gap between native 24 kHz HTTP PCM chunks for the segment |
-| `upstream_pcm_max_chunk_gap_ms` | Maximum gap between native 24 kHz HTTP PCM chunks for the segment |
+| `trigger_reason` | `vllm_clause`: vLLM owns the boundary; this does not distinguish punctuation from flush |
+| `text_characters` | Characters in the text unit reported by vLLM |
+| `first_24khz_audio_to_first_8khz_pcm_sent_ms` | First native PCM frame receipt through first public 8 kHz send |
+| `first_audio_ms` | vLLM `audio.start` to first public PCM frame |
+| `generation_ms` | vLLM `audio.start` to `audio.done` |
+| `upstream_pcm_first_to_second_chunk_ms` | Gap between the first two native 24 kHz WebSocket PCM frames |
+| `upstream_pcm_mean_chunk_gap_ms` | Mean native PCM frame gap for the segment |
+| `upstream_pcm_max_chunk_gap_ms` | Maximum native PCM frame gap for the segment |
 
-The event also carries server wall-clock timestamps for receipt, vLLM
-submission, first 24 kHz audio, and first 8 kHz send. Use the monotonic duration
-fields for server-internal analysis; client/server wall-clock subtraction
-depends on clock synchronization.
+The local text splitter, segment queue, 100 ms first-segment deadline, and
+word-boundary fallback have been removed. Their former enqueue, queue, and
+vLLM-send timing fields are unavailable on the native WebSocket path and must
+not be treated as zero. The load-test client still records
+`client_send_to_first_pcm_ms` and the server still emits `segment_done` and
+`flush_done` with the public `context_id`.
 
-The realtime segmenter releases the first complete clause or sentence after 20
-characters. If no punctuation arrives, only the first segment uses a safe word
-boundary at approximately 48 characters. Later unpunctuated segments use a
-safe boundary near the 100-character hard target. End-of-turn flushes the
-remainder immediately. Decimal numbers, thousands separators, common
-abbreviations, initials, and individual words are not split.
-
-The first segment also has a 100 ms deadline starting with its first text
-message. The receiver wakes at the deadline even if no further message arrives.
-It emits the latest whitespace-delimited prefix of at least 20 characters and
-retains an unfinished trailing word. With insufficient complete text, it waits
-for more input and checks again on arrival. The timer applies once per context,
-resets after flush, and does not reset the connection inactivity timeout.
-
-The realtime route omits `segment_started` by default; PCM is its first segment
-output. `segment_done`, `flush_done`, and their ordering remain intact. Two
-independent query parameters enable controlled comparisons on the same deployment:
-
-| Variant | `emit_segment_started` | `first_segment_max_wait_ms` |
-|---|---|---|
-| Previous behavior | `true` | `0` |
-| Omit start event only | `false` | `0` |
-| Deadline only | `true` | `100` |
-| Both (default) | `false` | `100` |
-
-Pass these on the base `--tts-url` used by `bot.py` or `load_test.py`, for example
-`--tts-url 'https://ENDPOINT.modal.run?emit_segment_started=false&first_segment_max_wait_ms=0'`.
-The URL is retained in the run summary; accepted settings appear in the server
-connection log and `ready` event. Deadline bounds are 0–1000 ms; 0 disables it.
-These local changes require deployment before a live latency comparison.
-
-The local Qwen realtime client also sends an application-level `{"type":"ping"}`
-after 10 seconds without an outgoing text, flush, or ping message. Incoming audio
-does not postpone it: the server's inactivity timer measures incoming application
-messages, not outgoing audio or WebSocket protocol heartbeats. When a shorter
-`inactivity_timeout` is supplied, the ping interval is one third of that timeout,
-capped at 10 seconds. The task stops on server final/error, teardown, or reconnect;
-ElevenLabs and the other transports are unchanged. This prevents healthy idle
-connections expiring; it does not change audio, repair an empty LLM response, or
-guarantee survival through network loss or an event-loop stall.
-
-For additive timing analysis, use first text → enqueue, enqueue → vLLM,
-vLLM → first native PCM, and native PCM → public PCM. Do not add
-`websocket_receive_to_vllm_send_ms` to text accumulation for deadline-triggered
-segments: those intervals overlap. Removing the start event is an experiment;
-its effect on Modal delivery batching has not yet been measured.
+`emit_segment_started` remains optional and defaults to false.
+`first_segment_max_wait_ms` is no longer supported except `0`, for clients
+that still send the disabled value. Application-level client pings keep the
+public connection active; the bridge also sends empty native `input.text`
+messages while idle so vLLM's separate application timeout does not close it.
+The native clause path is deployed to all three realtime functions. The
+US-East route returned authenticated 8 kHz PCM audio in a live check; the two
+AP routes have not been exercised after this deployment. vLLM-Omni 0.29
+rejects the realtime service's former `--kv-cache-metrics`,
+`--cudagraph-metrics`, and `--enable-mfu-metrics` CLI options for this pipeline.
+The realtime app omits those flags; its `/metrics` proxy still exposes stage
+and KV-cache metric families, but outer CUDA-graph and MFU counters must not
+be assumed present.
 
 Stage 0 codec-token cadence remains available in the stage histogram fields as
 `inter_token_latency_seconds` and `request_time_per_output_token_seconds`.
-These are kept separate from the HTTP PCM chunk-gap fields above.
+These are kept separate from the native WebSocket PCM frame-gap fields above.
 
 The realtime ASGI deployment uses a `4, 4, 8, 16, 25` codec-frame ramp before
 settling at the standard 25-frame steady-state cadence, with the pinned

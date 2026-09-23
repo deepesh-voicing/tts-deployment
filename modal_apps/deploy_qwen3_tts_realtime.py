@@ -19,9 +19,7 @@ import modal
 APP_NAME = "tts-l40s-qwen3-tts-realtime"
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 MODEL_REVISION = "0c0e3051f131929182e2c023b9537f8b1c68adfe"
-VLLM_OMNI_IMAGE = (
-    "vllm/vllm-omni@sha256:6f8be103eaf0055448cf7578cfd621405fd669079d4361bd58896326b2bf722a"
-)
+VLLM_OMNI_IMAGE = "vllm/vllm-openai:v0.29.0"
 
 GPU = "L40S"
 VLLM_PORT = 8000
@@ -50,17 +48,11 @@ MODAL_SERVER_STAGE_OVERRIDES = (
 API_KEYS_ENV = "TTS_API_KEYS_JSON"
 MAX_TEXT_MESSAGE_BYTES = 64 * 1024
 MAX_BUFFERED_TEXT_CHARACTERS = 4096
-MAX_SEGMENT_CHARACTERS = 100
-MIN_PUNCTUATION_SEGMENT_CHARACTERS = 20
-FIRST_SEGMENT_FALLBACK_CHARACTERS = 48
-FIRST_SEGMENT_MAX_WAIT_MS = 100
-SEGMENT_QUEUE_MAXSIZE = 4
 DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 30
 MIN_INACTIVITY_TIMEOUT_SECONDS = 5
 MAX_INACTIVITY_TIMEOUT_SECONDS = 180
 STAGE_UTILIZATION_LOG_INTERVAL_SECONDS = 1.0
 GPU_UTILIZATION_LOG_INTERVAL_SECONDS = 1.0
-KV_CACHE_METRICS_SAMPLE_RATE = 0.01
 
 _PROMETHEUS_SAMPLE_RE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)"
@@ -156,6 +148,8 @@ api_keys_secret = modal.Secret.from_name("qwen-tts-api-keys")
 image = (
     modal.Image.from_registry(VLLM_OMNI_IMAGE)
     .entrypoint([])
+    .run_commands("ln -sf /usr/bin/python3 /usr/bin/python")
+    .run_commands("uv pip install --system 'vllm-omni==0.29.0rc1' 'websockets==17.1'")
     .add_local_file(
         "modal_apps/configs/qwen3_tts_realtime_ramp.yaml",
         remote_path=DEPLOY_CONFIG_PATH,
@@ -610,131 +604,6 @@ def _authenticate_api_key(
     }
 
 
-_BOUNDARY_PUNCTUATION_RE = re.compile(r"[.!?,;:\n…。！？，；：،؛؟।॥]")
-_COMMON_ABBREVIATIONS = {
-    "dr",
-    "e.g",
-    "etc",
-    "i.e",
-    "jr",
-    "mr",
-    "mrs",
-    "ms",
-    "prof",
-    "sr",
-    "st",
-    "vs",
-}
-_CLOSING_PUNCTUATION = "\"'\u201d\u2019)]}"
-
-
-def _is_protected_boundary(text: str, index: int) -> bool:
-    punctuation = text[index]
-    previous = text[index - 1] if index else ""
-    following = text[index + 1] if index + 1 < len(text) else ""
-    if punctuation in ".,:" and previous.isdigit() and following.isdigit():
-        return True
-    if punctuation == "." and previous.isalnum() and following.isalnum():
-        return True
-    if punctuation != ".":
-        return False
-
-    token_match = re.search(r"([A-Za-z][A-Za-z.]*)$", text[:index])
-    if token_match is None:
-        return False
-    token = token_match.group(1)
-    if token.lower().strip(".") in _COMMON_ABBREVIATIONS:
-        return True
-    if re.fullmatch(r"(?:[A-Za-z]\.)+[A-Za-z]", token):
-        return True
-    return len(token) == 1 and token.isupper() and token not in {"A", "I"}
-
-
-def _find_linguistic_boundary(text: str, search_limit: int) -> int | None:
-    for match in _BOUNDARY_PUNCTUATION_RE.finditer(text[:search_limit]):
-        if match.end() < MIN_PUNCTUATION_SEGMENT_CHARACTERS:
-            continue
-        if _is_protected_boundary(text, match.start()):
-            continue
-        cut_at = match.end()
-        while cut_at < len(text) and text[cut_at] in ".!?\u2026":
-            cut_at += 1
-        while cut_at < len(text) and text[cut_at] in _CLOSING_PUNCTUATION:
-            cut_at += 1
-        return cut_at
-    return None
-
-
-def _find_word_boundary(text: str, target: int) -> int | None:
-    boundary = re.search(r"\s+", text[target:])
-    return target + boundary.start() if boundary is not None else None
-
-
-def _find_hard_limit_boundary(text: str) -> int | None:
-    prefix = text[: MAX_SEGMENT_CHARACTERS + 1]
-    boundaries = list(re.finditer(r"\s+", prefix))
-    if boundaries:
-        cut_at = boundaries[-1].start()
-        if cut_at >= MIN_PUNCTUATION_SEGMENT_CHARACTERS:
-            return cut_at
-    return _find_word_boundary(text, MAX_SEGMENT_CHARACTERS)
-
-
-def _find_first_segment_deadline_boundary(text: str) -> int | None:
-    # Only whitespace proves the preceding word is complete in a partial stream.
-    for boundary in reversed(list(re.finditer(r"\s+", text[: MAX_SEGMENT_CHARACTERS + 1]))):
-        prefix = text[: boundary.start()].rstrip()
-        if len(prefix.strip()) < MIN_PUNCTUATION_SEGMENT_CHARACTERS:
-            return None
-        if prefix.endswith(".") and _is_protected_boundary(text, len(prefix) - 1):
-            continue
-        return boundary.start()
-    return None
-
-
-def _split_realtime_text(
-    text: str,
-    *,
-    flush: bool,
-    split_first_segment_at_word_boundary: bool = False,
-    first_segment_deadline_expired: bool = False,
-) -> tuple[list[tuple[str, str]], str]:
-    """Return ``(text, trigger_reason)`` segments and the incomplete remainder."""
-    segments: list[tuple[str, str]] = []
-    remainder = text
-    allow_first_segment_split = split_first_segment_at_word_boundary
-    while remainder:
-        cut_at = _find_linguistic_boundary(
-            remainder,
-            min(len(remainder), MAX_SEGMENT_CHARACTERS),
-        )
-        trigger_reason = "punctuation"
-        if cut_at is None and allow_first_segment_split:
-            cut_at = _find_word_boundary(
-                remainder,
-                FIRST_SEGMENT_FALLBACK_CHARACTERS,
-            )
-            trigger_reason = "first_segment_fallback"
-        if cut_at is None and allow_first_segment_split and first_segment_deadline_expired:
-            cut_at = _find_first_segment_deadline_boundary(remainder)
-            trigger_reason = "first_segment_deadline"
-        if cut_at is None and len(remainder) > MAX_SEGMENT_CHARACTERS:
-            cut_at = _find_hard_limit_boundary(remainder)
-            trigger_reason = "hard_max"
-        if cut_at is None and flush:
-            cut_at = len(remainder)
-            trigger_reason = "flush"
-        if cut_at is None:
-            break
-
-        segment = remainder[:cut_at].strip()
-        remainder = remainder[cut_at:].lstrip()
-        if segment:
-            segments.append((segment, trigger_reason))
-            allow_first_segment_split = False
-    return segments, remainder
-
-
 def _parse_inactivity_timeout(raw_value: str | None) -> int:
     if raw_value is None:
         return DEFAULT_INACTIVITY_TIMEOUT_SECONDS
@@ -750,17 +619,13 @@ def _parse_inactivity_timeout(raw_value: str | None) -> int:
     return value
 
 
-def _parse_realtime_latency_options(query_params) -> tuple[bool, int]:
+def _parse_realtime_latency_options(query_params) -> bool:
     emit_started = query_params.get("emit_segment_started", "false").lower()
     if emit_started not in {"true", "false"}:
         raise ValueError("emit_segment_started must be true or false")
-    try:
-        max_wait_ms = int(query_params.get("first_segment_max_wait_ms", FIRST_SEGMENT_MAX_WAIT_MS))
-    except ValueError as exc:
-        raise ValueError("first_segment_max_wait_ms must be an integer") from exc
-    if not 0 <= max_wait_ms <= 1000:
-        raise ValueError("first_segment_max_wait_ms must be between 0 and 1000")
-    return emit_started == "true", max_wait_ms
+    if query_params.get("first_segment_max_wait_ms", "0") != "0":
+        raise ValueError("first_segment_max_wait_ms is unsupported with native clause splitting")
+    return emit_started == "true"
 
 
 def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
@@ -770,6 +635,7 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
     import av
     import httpx
     import numpy as np
+    import websockets
     from fastapi import (
         FastAPI,
         HTTPException,
@@ -788,8 +654,6 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
         MODEL_ID,
         "--revision",
         MODEL_REVISION,
-        "--served-model-name",
-        MODEL_ID,
         "--omni",
         "--deploy-config",
         DEPLOY_CONFIG_PATH,
@@ -801,16 +665,7 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
         stage_overrides,
     ]
     if log_stage_utilization:
-        vllm_command.extend(
-            [
-                "--log-stats",
-                "--kv-cache-metrics",
-                "--kv-cache-metrics-sample",
-                str(KV_CACHE_METRICS_SAMPLE_RATE),
-                "--cudagraph-metrics",
-                "--enable-mfu-metrics",
-            ]
-        )
+        vllm_command.append("--log-stats")
     vllm_process = subprocess.Popen(vllm_command)
 
     health_url = f"http://127.0.0.1:{VLLM_PORT}/health"
@@ -989,9 +844,9 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                         "event": "vllm_stage_utilization_config",
                         "sample_interval_seconds": STAGE_UTILIZATION_LOG_INTERVAL_SECONDS,
                         "gpu_sample_interval_seconds": GPU_UTILIZATION_LOG_INTERVAL_SECONDS,
-                        "kv_cache_metrics_sample_rate": KV_CACHE_METRICS_SAMPLE_RATE,
-                        "cudagraph_metrics_enabled": True,
-                        "mfu_metrics_enabled": True,
+                        "kv_cache_metrics_sample_rate": None,
+                        "cudagraph_metrics_enabled": False,
+                        "mfu_metrics_enabled": False,
                         "code2wav_cudagraph_stats_enabled": True,
                         "codec_chunk_frames": CODEC_CHUNK_FRAMES,
                         "codec_chunk_ramp": CODEC_CHUNK_RAMP,
@@ -1021,6 +876,7 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             await api.state.vllm_client.aclose()
 
     api = FastAPI(title="Qwen3-TTS CustomVoice 8 kHz", lifespan=lifespan)
+    api.state.native_clause_connect = websockets.connect
     api.state.vllm_process = vllm_process
     api.state.api_key_records = api_key_records
     api.state.active_api_connections = {}
@@ -1869,9 +1725,364 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             )
             await release_websocket_api_key(websocket, key_id)
 
+    async def relay_native_clause(
+        websocket: WebSocket,
+        *,
+        voice_id: str,
+        language: str | None,
+        inactivity_timeout: int,
+        emit_segment_started: bool,
+        key_id: str,
+        connection_id: str,
+    ) -> tuple[int, int]:
+        """Keep the public protocol while vLLM owns all text segmentation."""
+        send_lock = asyncio.Lock()
+        contexts: dict[int, str | None] = {}
+        first_text_receive_wall_ns: dict[int, int] = {}
+        utterance_index = 0
+        utterance_characters = 0
+        current_context_id: str | None = None
+        close_requested = False
+        segments_completed = 0
+        audio_bytes_sent = 0
+        text_receive_task: asyncio.Task[str] | None = None
+
+        async def send_public_json(payload: dict[str, object]) -> None:
+            async with send_lock:
+                await websocket.send_json(payload)
+
+        upstream_url = f"ws://127.0.0.1:{VLLM_PORT}/v1/audio/speech/stream"
+        async with websocket.app.state.native_clause_connect(
+            upstream_url, open_timeout=10, max_size=None, max_queue=16
+        ) as upstream:
+            upstream_config: dict[str, object] = {
+                "type": "session.config",
+                "model": MODEL_ID,
+                "task_type": "CustomVoice",
+                "voice": voice_id,
+                "response_format": "pcm",
+                "stream_audio": True,
+                "split_granularity": "clause",
+            }
+            if language is not None:
+                upstream_config["language"] = language
+            await upstream.send(json.dumps(upstream_config))
+            await send_public_json(
+                {
+                    "type": "ready",
+                    "connection_id": connection_id,
+                    "emit_segment_started": emit_segment_started,
+                    "first_segment_max_wait_ms": 0,
+                    "sample_rate": OUTPUT_SAMPLE_RATE,
+                    "channels": 1,
+                    "encoding": "pcm_s16le",
+                }
+            )
+
+            async def receive_client() -> None:
+                nonlocal utterance_index, utterance_characters, current_context_id
+                nonlocal close_requested, text_receive_task
+                last_message_ns = time.monotonic_ns()
+                while True:
+                    elapsed = (time.monotonic_ns() - last_message_ns) / 1e9
+                    remaining = inactivity_timeout - elapsed
+                    if remaining <= 0:
+                        await send_public_json({"type": "error", "error": "inactivity_timeout"})
+                        async with send_lock:
+                            await websocket.close(code=4408, reason="Inactivity timeout")
+                        raise WebSocketDisconnect(code=4408)
+                    if text_receive_task is None:
+                        text_receive_task = asyncio.create_task(websocket.receive_text())
+                    done, _ = await asyncio.wait({text_receive_task}, timeout=min(remaining, 15.0))
+                    if not done:
+                        # Native vLLM's application idle timer ignores WebSocket ping frames.
+                        await upstream.send(json.dumps({"type": "input.text", "text": ""}))
+                        continue
+                    raw_message = text_receive_task.result()
+                    text_receive_task = None
+                    last_message_ns = time.monotonic_ns()
+                    if len(raw_message.encode("utf-8")) > MAX_TEXT_MESSAGE_BYTES:
+                        await send_public_json({"type": "error", "error": "message_too_large"})
+                        async with send_lock:
+                            await websocket.close(code=4400, reason="Message too large")
+                        raise WebSocketDisconnect(code=4400)
+                    try:
+                        message = json.loads(raw_message)
+                    except json.JSONDecodeError:
+                        await send_public_json({"type": "error", "error": "invalid_json"})
+                        continue
+                    if not isinstance(message, dict):
+                        await send_public_json({"type": "error", "error": "invalid_message"})
+                        continue
+                    message_type = message.get("type")
+                    if message_type == "ping":
+                        await upstream.send(json.dumps({"type": "input.text", "text": ""}))
+                        await send_public_json(
+                            {
+                                "type": "pong",
+                                "client_wall_time_ns": message.get("client_wall_time_ns"),
+                                "server_wall_time_ns": time.time_ns(),
+                            }
+                        )
+                        continue
+                    if message_type == "close":
+                        if utterance_characters:
+                            await upstream.send(json.dumps({"type": "input.done"}))
+                        close_requested = True
+                        await upstream.send(json.dumps({"type": "session.close"}))
+                        return
+                    if message_type != "text":
+                        await send_public_json(
+                            {"type": "error", "error": "unsupported_message_type"}
+                        )
+                        continue
+                    text = message.get("text")
+                    if not isinstance(text, str):
+                        await send_public_json({"type": "error", "error": "text_must_be_string"})
+                        continue
+                    raw_context_id = message.get("context_id")
+                    context_id = str(raw_context_id)[:128] if raw_context_id is not None else None
+                    if utterance_characters and context_id != current_context_id:
+                        await send_public_json(
+                            {"type": "error", "error": "context_changed_before_flush"}
+                        )
+                        continue
+                    if utterance_characters + len(text) > MAX_BUFFERED_TEXT_CHARACTERS:
+                        await send_public_json(
+                            {"type": "error", "error": "text_buffer_limit_exceeded"}
+                        )
+                        async with send_lock:
+                            await websocket.close(code=4400, reason="Text buffer limit exceeded")
+                        raise WebSocketDisconnect(code=4400)
+                    if text:
+                        if not utterance_characters:
+                            current_context_id = context_id
+                            first_text_receive_wall_ns[utterance_index] = time.time_ns()
+                        utterance_characters += len(text)
+                        contexts[utterance_index] = current_context_id
+                        await upstream.send(json.dumps({"type": "input.text", "text": text}))
+                    if message.get("flush") is True:
+                        contexts.setdefault(utterance_index, current_context_id)
+                        await upstream.send(json.dumps({"type": "input.done"}))
+                        utterance_index += 1
+                        utterance_characters = 0
+                        current_context_id = None
+
+            async def receive_upstream() -> None:
+                nonlocal segments_completed, audio_bytes_sent
+                active: dict[str, object] | None = None
+                next_segment_id = 1
+
+                async def send_pcm(chunk: bytes) -> None:
+                    nonlocal audio_bytes_sent
+                    assert active is not None
+                    pcm = active["remainder"] + chunk
+                    complete_bytes = len(pcm) - (len(pcm) % 2)
+                    active["remainder"] = pcm[complete_bytes:]
+                    if not complete_bytes:
+                        return
+                    samples = np.frombuffer(pcm[:complete_bytes], dtype="<i2")
+                    frame = av.AudioFrame.from_ndarray(
+                        samples.reshape(1, -1), format="s16", layout="mono"
+                    )
+                    frame.sample_rate = SOURCE_SAMPLE_RATE
+                    for output in active["resampler"].resample(frame):
+                        output_chunk = output.to_ndarray().astype("<i2", copy=False).tobytes()
+                        if output_chunk:
+                            async with send_lock:
+                                await websocket.send_bytes(output_chunk)
+                            active["output_bytes"] += len(output_chunk)
+                            active["output_chunks"] += 1
+                            audio_bytes_sent += len(output_chunk)
+                            active.setdefault("first_8khz_pcm_sent_wall_ns", time.time_ns())
+                            active.setdefault(
+                                "first_8khz_pcm_sent_monotonic_ns", time.monotonic_ns()
+                            )
+
+                async for message in upstream:
+                    if isinstance(message, bytes):
+                        if active is None:
+                            raise RuntimeError("vLLM sent PCM without audio.start")
+                        now_ns = time.monotonic_ns()
+                        active.setdefault("first_24khz_audio_wall_ns", time.time_ns())
+                        active.setdefault("first_24khz_audio_monotonic_ns", now_ns)
+                        previous_ns = active.get("previous_chunk_ns")
+                        if previous_ns is not None:
+                            active["chunk_gaps_ns"].append(now_ns - previous_ns)
+                        active["previous_chunk_ns"] = now_ns
+                        active["input_bytes"] += len(message)
+                        await send_pcm(message)
+                        continue
+                    event = json.loads(message)
+                    event_type = event.get("type")
+                    if event_type == "audio.start":
+                        if active is not None:
+                            raise RuntimeError("vLLM started overlapping audio segments")
+                        if event.get("sample_rate", SOURCE_SAMPLE_RATE) != SOURCE_SAMPLE_RATE:
+                            raise RuntimeError("vLLM audio sample rate is not 24 kHz")
+                        segment_id = next_segment_id
+                        next_segment_id += 1
+                        active = {
+                            "segment_id": segment_id,
+                            "utterance_index": int(event["utterance_index"]),
+                            "sentence_index": int(event["sentence_index"]),
+                            "text": str(event.get("sentence_text", "")),
+                            "started_ns": time.monotonic_ns(),
+                            "remainder": b"",
+                            "resampler": av.AudioResampler(
+                                format="s16", layout="mono", rate=OUTPUT_SAMPLE_RATE
+                            ),
+                            "input_bytes": 0,
+                            "output_bytes": 0,
+                            "output_chunks": 0,
+                            "chunk_gaps_ns": [],
+                        }
+                        if emit_segment_started:
+                            await send_public_json(
+                                {
+                                    "type": "segment_started",
+                                    "segment_id": segment_id,
+                                    "context_id": contexts.get(active["utterance_index"]),
+                                }
+                            )
+                    elif event_type == "audio.done":
+                        if active is None:
+                            raise RuntimeError("vLLM sent audio.done without audio.start")
+                        if event.get("error"):
+                            raise RuntimeError("vLLM failed to generate audio")
+                        if active["remainder"]:
+                            raise RuntimeError("vLLM returned an incomplete PCM16 sample")
+                        for output in active["resampler"].resample(None):
+                            output_chunk = output.to_ndarray().astype("<i2", copy=False).tobytes()
+                            if output_chunk:
+                                async with send_lock:
+                                    await websocket.send_bytes(output_chunk)
+                                active["output_bytes"] += len(output_chunk)
+                                active["output_chunks"] += 1
+                                audio_bytes_sent += len(output_chunk)
+                                active.setdefault("first_8khz_pcm_sent_wall_ns", time.time_ns())
+                                active.setdefault(
+                                    "first_8khz_pcm_sent_monotonic_ns", time.monotonic_ns()
+                                )
+                        segments_completed += 1
+                        chunk_gaps_ns = active["chunk_gaps_ns"]
+                        first_24khz_ns = active.get("first_24khz_audio_monotonic_ns")
+                        first_8khz_ns = active.get("first_8khz_pcm_sent_monotonic_ns")
+                        timing_metrics = {
+                            "first_audio_ms": (
+                                round((first_8khz_ns - active["started_ns"]) / 1_000_000, 3)
+                                if first_8khz_ns is not None
+                                else None
+                            ),
+                            "generation_ms": round(
+                                (time.monotonic_ns() - active["started_ns"]) / 1_000_000, 3
+                            ),
+                            "first_24khz_audio_to_first_8khz_pcm_sent_ms": (
+                                round((first_8khz_ns - first_24khz_ns) / 1_000_000, 3)
+                                if first_24khz_ns is not None and first_8khz_ns is not None
+                                else None
+                            ),
+                            "upstream_pcm_first_to_second_chunk_ms": (
+                                round(chunk_gaps_ns[0] / 1_000_000, 3) if chunk_gaps_ns else None
+                            ),
+                            "upstream_pcm_mean_chunk_gap_ms": (
+                                round(sum(chunk_gaps_ns) / len(chunk_gaps_ns) / 1_000_000, 3)
+                                if chunk_gaps_ns
+                                else None
+                            ),
+                            "upstream_pcm_max_chunk_gap_ms": (
+                                round(max(chunk_gaps_ns) / 1_000_000, 3) if chunk_gaps_ns else None
+                            ),
+                        }
+                        done_event = {
+                            "type": "segment_done",
+                            "segment_id": active["segment_id"],
+                            "context_id": contexts.get(active["utterance_index"]),
+                            "trigger_reason": "vllm_clause",
+                            "text_characters": len(active["text"]),
+                            "output_bytes": active["output_bytes"],
+                            "output_chunks": active["output_chunks"],
+                            "first_text_receive_wall_ns": first_text_receive_wall_ns.get(
+                                active["utterance_index"]
+                            ),
+                            "first_24khz_audio_wall_ns": active.get("first_24khz_audio_wall_ns"),
+                            "first_8khz_pcm_sent_wall_ns": active.get(
+                                "first_8khz_pcm_sent_wall_ns"
+                            ),
+                            **timing_metrics,
+                        }
+                        await send_public_json(done_event)
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "realtime_tts_segment",
+                                    "api_key_id": key_id,
+                                    "connection_id": connection_id,
+                                    "segment_id": active["segment_id"],
+                                    "trigger_reason": "vllm_clause",
+                                    "text_characters": len(active["text"]),
+                                    "input_bytes": active["input_bytes"],
+                                    "output_bytes": active["output_bytes"],
+                                    "output_chunks": active["output_chunks"],
+                                    **timing_metrics,
+                                    "wall_time_ns": time.time_ns(),
+                                },
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                        active = None
+                    elif event_type == "session.done":
+                        completed_utterance = int(event["utterance_index"])
+                        await send_public_json(
+                            {
+                                "type": "flush_done",
+                                "context_id": contexts.pop(completed_utterance, None),
+                            }
+                        )
+                        first_text_receive_wall_ns.pop(completed_utterance, None)
+                    elif event_type == "error":
+                        raise RuntimeError("vLLM WebSocket returned an error")
+                    else:
+                        raise RuntimeError(f"Unexpected vLLM WebSocket event: {event_type}")
+
+                if not close_requested:
+                    raise RuntimeError("vLLM WebSocket closed unexpectedly")
+                await send_public_json(
+                    {
+                        "type": "final",
+                        "segments_completed": segments_completed,
+                        "audio_bytes": audio_bytes_sent,
+                    }
+                )
+                async with send_lock:
+                    await websocket.close(code=1000)
+
+            receiver_task = asyncio.create_task(receive_client())
+            generator_task = asyncio.create_task(receive_upstream())
+            try:
+                done, _ = await asyncio.wait(
+                    {receiver_task, generator_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if generator_task in done:
+                    generator_task.result()
+                else:
+                    receiver_task.result()
+                    await generator_task
+            finally:
+                tasks = [receiver_task, generator_task]
+                if text_receive_task is not None:
+                    tasks.append(text_receive_task)
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        return segments_completed, audio_bytes_sent
+
     @api.websocket("/v1/text-to-speech/{voice_id}/stream-input")
     async def realtime_stream_input(websocket: WebSocket, voice_id: str):
-        """Buffer partial text and stream ordered Qwen audio segments."""
+        """Relay partial text to vLLM's native clause splitter and stream 8 kHz PCM."""
         api_key_record = await acquire_websocket_api_key(websocket)
         if api_key_record is None:
             return
@@ -1885,9 +2096,7 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             inactivity_timeout = _parse_inactivity_timeout(
                 websocket.query_params.get("inactivity_timeout")
             )
-            emit_segment_started, first_segment_max_wait_ms = _parse_realtime_latency_options(
-                websocket.query_params
-            )
+            emit_segment_started = _parse_realtime_latency_options(websocket.query_params)
         except ValueError as exc:
             log_websocket_handshake(
                 websocket,
@@ -1955,575 +2164,15 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
 
         connection_id = uuid.uuid4().hex
         opened_ns = time.time_ns()
-        segment_queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue(
-            maxsize=SEGMENT_QUEUE_MAXSIZE
-        )
-        send_lock = asyncio.Lock()
-        buffered_text = ""
-        buffered_context_id: str | None = None
-        buffered_context_has_segment = False
-        buffered_text_first_receive_wall_ns: int | None = None
-        buffered_text_first_receive_monotonic_ns: int | None = None
-        buffered_text_last_receive_wall_ns: int | None = None
-        buffered_text_last_receive_monotonic_ns: int | None = None
-        first_segment_deadline_expired = False
-        text_receive_task: asyncio.Task[str] | None = None
-        next_segment_id = 1
         segments_completed = 0
         audio_bytes_sent = 0
-
-        async def send_json(payload: dict[str, object]) -> None:
-            async with send_lock:
-                await websocket.send_json(payload)
-
-        async def queue_segments(
-            segments: list[tuple[str, str]],
-            context_id: str | None,
-            *,
-            websocket_receive_wall_ns: int,
-            websocket_receive_monotonic_ns: int,
-            first_text_receive_wall_ns: int | None,
-            first_text_receive_monotonic_ns: int | None,
-        ) -> None:
-            nonlocal next_segment_id
-            for segment, trigger_reason in segments:
-                await segment_queue.put(
-                    {
-                        "kind": "segment",
-                        "segment_id": next_segment_id,
-                        "text": segment,
-                        "enqueued_ns": time.monotonic_ns(),
-                        "context_id": context_id,
-                        "trigger_reason": trigger_reason,
-                        "websocket_receive_wall_ns": websocket_receive_wall_ns,
-                        "websocket_receive_monotonic_ns": websocket_receive_monotonic_ns,
-                        "first_text_receive_wall_ns": (
-                            first_text_receive_wall_ns or websocket_receive_wall_ns
-                        ),
-                        "first_text_receive_monotonic_ns": (
-                            first_text_receive_monotonic_ns or websocket_receive_monotonic_ns
-                        ),
-                    }
-                )
-                next_segment_id += 1
-
-        async def receive_text() -> None:
-            nonlocal buffered_context_has_segment, buffered_context_id, buffered_text
-            nonlocal buffered_text_first_receive_monotonic_ns
-            nonlocal buffered_text_first_receive_wall_ns
-            nonlocal buffered_text_last_receive_wall_ns, buffered_text_last_receive_monotonic_ns
-            nonlocal first_segment_deadline_expired, text_receive_task
-            last_message_received_ns = time.monotonic_ns()
-            while True:
-                now_ns = time.monotonic_ns()
-                deadline_ns = None
-                if (
-                    first_segment_max_wait_ms > 0
-                    and not buffered_context_has_segment
-                    and not first_segment_deadline_expired
-                    and buffered_text_first_receive_monotonic_ns is not None
-                ):
-                    deadline_ns = (
-                        buffered_text_first_receive_monotonic_ns
-                        + first_segment_max_wait_ms * 1_000_000
-                    )
-                if deadline_ns is not None and now_ns >= deadline_ns:
-                    first_segment_deadline_expired = True
-                    segments, buffered_text = _split_realtime_text(
-                        buffered_text,
-                        flush=False,
-                        split_first_segment_at_word_boundary=True,
-                        first_segment_deadline_expired=True,
-                    )
-                    if segments:
-                        buffered_context_has_segment = True
-                    await queue_segments(
-                        segments,
-                        buffered_context_id,
-                        websocket_receive_wall_ns=buffered_text_last_receive_wall_ns,
-                        websocket_receive_monotonic_ns=buffered_text_last_receive_monotonic_ns,
-                        first_text_receive_wall_ns=buffered_text_first_receive_wall_ns,
-                        first_text_receive_monotonic_ns=buffered_text_first_receive_monotonic_ns,
-                    )
-                    if not buffered_text:
-                        buffered_text_first_receive_wall_ns = None
-                        buffered_text_first_receive_monotonic_ns = None
-                    continue
-
-                inactivity_deadline_ns = last_message_received_ns + inactivity_timeout * 1e9
-                if now_ns >= inactivity_deadline_ns:
-                    await send_json(
-                        {
-                            "type": "error",
-                            "error": "inactivity_timeout",
-                        }
-                    )
-                    await websocket.close(code=4408, reason="Inactivity timeout")
-                    raise WebSocketDisconnect(code=4408)
-
-                if text_receive_task is None:
-                    text_receive_task = asyncio.create_task(websocket.receive_text())
-                wake_at_ns = min(inactivity_deadline_ns, deadline_ns or inactivity_deadline_ns)
-                done, _ = await asyncio.wait(
-                    {text_receive_task},
-                    timeout=max(0.0, (wake_at_ns - now_ns) / 1e9),
-                )
-                if not done:
-                    continue
-                # Keep the same receive task across timer wakeups so no message is lost.
-                raw_message = text_receive_task.result()
-                text_receive_task = None
-                websocket_receive_wall_ns = time.time_ns()
-                websocket_receive_monotonic_ns = time.monotonic_ns()
-                last_message_received_ns = websocket_receive_monotonic_ns
-
-                if len(raw_message.encode("utf-8")) > MAX_TEXT_MESSAGE_BYTES:
-                    await send_json(
-                        {
-                            "type": "error",
-                            "error": "message_too_large",
-                        }
-                    )
-                    await websocket.close(code=4400, reason="Message too large")
-                    raise WebSocketDisconnect(code=4400)
-                try:
-                    message = json.loads(raw_message)
-                except json.JSONDecodeError:
-                    await send_json({"type": "error", "error": "invalid_json"})
-                    continue
-                if not isinstance(message, dict):
-                    await send_json({"type": "error", "error": "invalid_message"})
-                    continue
-
-                message_type = message.get("type")
-                if message_type == "ping":
-                    await send_json(
-                        {
-                            "type": "pong",
-                            "client_wall_time_ns": message.get("client_wall_time_ns"),
-                            "server_wall_time_ns": time.time_ns(),
-                        }
-                    )
-                    continue
-                if message_type == "close":
-                    segments, buffered_text = _split_realtime_text(
-                        buffered_text,
-                        flush=True,
-                    )
-                    await queue_segments(
-                        segments,
-                        buffered_context_id,
-                        websocket_receive_wall_ns=websocket_receive_wall_ns,
-                        websocket_receive_monotonic_ns=websocket_receive_monotonic_ns,
-                        first_text_receive_wall_ns=buffered_text_first_receive_wall_ns,
-                        first_text_receive_monotonic_ns=(buffered_text_first_receive_monotonic_ns),
-                    )
-                    if segments:
-                        await segment_queue.put(
-                            {
-                                "kind": "flush",
-                                "context_id": buffered_context_id,
-                            }
-                        )
-                    buffered_context_id = None
-                    buffered_text_first_receive_wall_ns = None
-                    buffered_text_first_receive_monotonic_ns = None
-                    await segment_queue.put(None)
-                    return
-                if message_type != "text":
-                    await send_json(
-                        {
-                            "type": "error",
-                            "error": "unsupported_message_type",
-                        }
-                    )
-                    continue
-
-                text = message.get("text")
-                if not isinstance(text, str):
-                    await send_json({"type": "error", "error": "text_must_be_string"})
-                    continue
-                raw_context_id = message.get("context_id")
-                context_id = str(raw_context_id)[:128] if raw_context_id is not None else None
-                if buffered_context_id is None:
-                    buffered_context_id = context_id
-                elif context_id != buffered_context_id:
-                    await send_json(
-                        {
-                            "type": "error",
-                            "error": "context_changed_before_flush",
-                        }
-                    )
-                    continue
-                if text and not buffered_text:
-                    buffered_text_first_receive_wall_ns = websocket_receive_wall_ns
-                    buffered_text_first_receive_monotonic_ns = websocket_receive_monotonic_ns
-                buffered_text_last_receive_wall_ns = websocket_receive_wall_ns
-                buffered_text_last_receive_monotonic_ns = websocket_receive_monotonic_ns
-                buffered_text += text
-                segments, buffered_text = _split_realtime_text(
-                    buffered_text,
-                    flush=message.get("flush") is True,
-                    split_first_segment_at_word_boundary=(not buffered_context_has_segment),
-                    first_segment_deadline_expired=first_segment_deadline_expired,
-                )
-                if len(buffered_text) > MAX_BUFFERED_TEXT_CHARACTERS:
-                    await send_json(
-                        {
-                            "type": "error",
-                            "error": "text_buffer_limit_exceeded",
-                        }
-                    )
-                    await websocket.close(code=4400, reason="Text buffer limit exceeded")
-                    raise WebSocketDisconnect(code=4400)
-                if segments:
-                    buffered_context_has_segment = True
-                await queue_segments(
-                    segments,
-                    buffered_context_id,
-                    websocket_receive_wall_ns=websocket_receive_wall_ns,
-                    websocket_receive_monotonic_ns=websocket_receive_monotonic_ns,
-                    first_text_receive_wall_ns=buffered_text_first_receive_wall_ns,
-                    first_text_receive_monotonic_ns=buffered_text_first_receive_monotonic_ns,
-                )
-                if not buffered_text:
-                    buffered_text_first_receive_wall_ns = None
-                    buffered_text_first_receive_monotonic_ns = None
-                if message.get("flush") is True:
-                    await segment_queue.put(
-                        {
-                            "kind": "flush",
-                            "context_id": buffered_context_id,
-                        }
-                    )
-                    buffered_context_id = None
-                    buffered_context_has_segment = False
-                    first_segment_deadline_expired = False
-                    buffered_text_first_receive_wall_ns = None
-                    buffered_text_first_receive_monotonic_ns = None
-                    buffered_text_last_receive_wall_ns = None
-                    buffered_text_last_receive_monotonic_ns = None
-
-        async def synthesize_segment(
-            segment_id: int,
-            text: str,
-            enqueued_ns: int,
-            context_id: str | None,
-            trigger_reason: str,
-            websocket_receive_wall_ns: int,
-            websocket_receive_monotonic_ns: int,
-            first_text_receive_wall_ns: int,
-            first_text_receive_monotonic_ns: int,
-        ) -> None:
-            nonlocal segments_completed, audio_bytes_sent
-            trace_id = uuid.uuid4().hex
-            segment_started_monotonic_ns = time.monotonic_ns()
-            payload: dict[str, object] = {
-                "model": MODEL_ID,
-                "input": text,
-                "task_type": "CustomVoice",
-                "voice": voice_id,
-                "response_format": "pcm",
-                "stream": True,
-                "stream_format": "audio",
-            }
-            if language is not None:
-                payload["language"] = language
-
-            upstream_request = websocket.app.state.vllm_client.build_request(
-                "POST",
-                f"http://127.0.0.1:{VLLM_PORT}/v1/audio/speech",
-                json=payload,
-                headers={"X-Trace-Id": trace_id},
-            )
-            vllm_request_sent_wall_ns = time.time_ns()
-            vllm_request_sent_monotonic_ns = time.monotonic_ns()
-            upstream = await websocket.app.state.vllm_client.send(
-                upstream_request,
-                stream=True,
-            )
-            input_bytes = 0
-            output_bytes = 0
-            output_chunks = 0
-            first_audio_monotonic_ns = None
-            first_24khz_audio_wall_ns = None
-            first_24khz_audio_monotonic_ns = None
-            first_8khz_pcm_sent_wall_ns = None
-            first_8khz_pcm_sent_monotonic_ns = None
-            previous_24khz_audio_monotonic_ns = None
-            upstream_pcm_chunk_gap_count = 0
-            upstream_pcm_chunk_gap_total_ns = 0
-            upstream_pcm_chunk_gap_max_ns = 0
-            upstream_pcm_first_to_second_chunk_ns = None
-            remainder = b""
-            resampler = av.AudioResampler(
-                format="s16",
-                layout="mono",
-                rate=OUTPUT_SAMPLE_RATE,
-            )
-            try:
-                if upstream.status_code != 200:
-                    await upstream.aread()
-                    raise RuntimeError(f"Qwen returned HTTP {upstream.status_code}")
-                if emit_segment_started:
-                    await send_json(
-                        {
-                            "type": "segment_started",
-                            "segment_id": segment_id,
-                            "context_id": context_id,
-                        }
-                    )
-                async for chunk in upstream.aiter_raw():
-                    if not chunk:
-                        continue
-                    chunk_received_monotonic_ns = time.monotonic_ns()
-                    if first_24khz_audio_wall_ns is None:
-                        first_24khz_audio_wall_ns = time.time_ns()
-                        first_24khz_audio_monotonic_ns = chunk_received_monotonic_ns
-                    if previous_24khz_audio_monotonic_ns is not None:
-                        chunk_gap_ns = (
-                            chunk_received_monotonic_ns - previous_24khz_audio_monotonic_ns
-                        )
-                        if upstream_pcm_chunk_gap_count == 0:
-                            upstream_pcm_first_to_second_chunk_ns = chunk_gap_ns
-                        upstream_pcm_chunk_gap_count += 1
-                        upstream_pcm_chunk_gap_total_ns += chunk_gap_ns
-                        upstream_pcm_chunk_gap_max_ns = max(
-                            upstream_pcm_chunk_gap_max_ns,
-                            chunk_gap_ns,
-                        )
-                    previous_24khz_audio_monotonic_ns = chunk_received_monotonic_ns
-                    input_bytes += len(chunk)
-                    pcm = remainder + chunk
-                    complete_bytes = len(pcm) - (len(pcm) % 2)
-                    remainder = pcm[complete_bytes:]
-                    if not complete_bytes:
-                        continue
-                    samples = np.frombuffer(pcm[:complete_bytes], dtype="<i2")
-                    frame = av.AudioFrame.from_ndarray(
-                        samples.reshape(1, -1),
-                        format="s16",
-                        layout="mono",
-                    )
-                    frame.sample_rate = SOURCE_SAMPLE_RATE
-                    for output in resampler.resample(frame):
-                        output_chunk = output.to_ndarray().astype("<i2", copy=False).tobytes()
-                        if not output_chunk:
-                            continue
-                        if first_audio_monotonic_ns is None:
-                            first_audio_monotonic_ns = time.monotonic_ns()
-                        async with send_lock:
-                            await websocket.send_bytes(output_chunk)
-                        if first_8khz_pcm_sent_wall_ns is None:
-                            first_8khz_pcm_sent_wall_ns = time.time_ns()
-                            first_8khz_pcm_sent_monotonic_ns = time.monotonic_ns()
-                        output_bytes += len(output_chunk)
-                        output_chunks += 1
-                if remainder:
-                    raise RuntimeError("Qwen returned an incomplete PCM16 sample")
-                for output in resampler.resample(None):
-                    output_chunk = output.to_ndarray().astype("<i2", copy=False).tobytes()
-                    if not output_chunk:
-                        continue
-                    if first_audio_monotonic_ns is None:
-                        first_audio_monotonic_ns = time.monotonic_ns()
-                    async with send_lock:
-                        await websocket.send_bytes(output_chunk)
-                    if first_8khz_pcm_sent_wall_ns is None:
-                        first_8khz_pcm_sent_wall_ns = time.time_ns()
-                        first_8khz_pcm_sent_monotonic_ns = time.monotonic_ns()
-                    output_bytes += len(output_chunk)
-                    output_chunks += 1
-            finally:
-                await upstream.aclose()
-
-            completed_ns = time.time_ns()
-            completed_monotonic_ns = time.monotonic_ns()
-            segments_completed += 1
-            audio_bytes_sent += output_bytes
-            timing_metrics = {
-                "segment_enqueue_to_vllm_send_ms": round(
-                    (vllm_request_sent_monotonic_ns - enqueued_ns) / 1_000_000,
-                    3,
-                ),
-                "first_text_receive_to_segment_enqueue_ms": round(
-                    (enqueued_ns - first_text_receive_monotonic_ns) / 1_000_000,
-                    3,
-                ),
-                "websocket_receive_to_vllm_send_ms": round(
-                    (vllm_request_sent_monotonic_ns - websocket_receive_monotonic_ns) / 1_000_000,
-                    3,
-                ),
-                "vllm_send_to_first_24khz_audio_ms": (
-                    round(
-                        (first_24khz_audio_monotonic_ns - vllm_request_sent_monotonic_ns)
-                        / 1_000_000,
-                        3,
-                    )
-                    if first_24khz_audio_monotonic_ns is not None
-                    else None
-                ),
-                "first_24khz_audio_to_first_8khz_pcm_sent_ms": (
-                    round(
-                        (first_8khz_pcm_sent_monotonic_ns - first_24khz_audio_monotonic_ns)
-                        / 1_000_000,
-                        3,
-                    )
-                    if first_24khz_audio_monotonic_ns is not None
-                    and first_8khz_pcm_sent_monotonic_ns is not None
-                    else None
-                ),
-                "queue_ms": round(
-                    (segment_started_monotonic_ns - enqueued_ns) / 1_000_000,
-                    3,
-                ),
-                "first_audio_ms": (
-                    round(
-                        (first_audio_monotonic_ns - segment_started_monotonic_ns) / 1_000_000,
-                        3,
-                    )
-                    if first_audio_monotonic_ns is not None
-                    else None
-                ),
-                "generation_ms": round(
-                    (completed_monotonic_ns - segment_started_monotonic_ns) / 1_000_000,
-                    3,
-                ),
-                "upstream_pcm_first_to_second_chunk_ms": (
-                    round(upstream_pcm_first_to_second_chunk_ns / 1_000_000, 3)
-                    if upstream_pcm_first_to_second_chunk_ns is not None
-                    else None
-                ),
-                "upstream_pcm_mean_chunk_gap_ms": (
-                    round(
-                        upstream_pcm_chunk_gap_total_ns / upstream_pcm_chunk_gap_count / 1_000_000,
-                        3,
-                    )
-                    if upstream_pcm_chunk_gap_count
-                    else None
-                ),
-                "upstream_pcm_max_chunk_gap_ms": (
-                    round(upstream_pcm_chunk_gap_max_ns / 1_000_000, 3)
-                    if upstream_pcm_chunk_gap_count
-                    else None
-                ),
-            }
-            await send_json(
-                {
-                    "type": "segment_done",
-                    "segment_id": segment_id,
-                    "context_id": context_id,
-                    "trigger_reason": trigger_reason,
-                    "text_characters": len(text),
-                    "output_bytes": output_bytes,
-                    "output_chunks": output_chunks,
-                    "websocket_receive_wall_ns": websocket_receive_wall_ns,
-                    "first_text_receive_wall_ns": first_text_receive_wall_ns,
-                    "vllm_request_sent_wall_ns": vllm_request_sent_wall_ns,
-                    "first_24khz_audio_wall_ns": first_24khz_audio_wall_ns,
-                    "first_8khz_pcm_sent_wall_ns": first_8khz_pcm_sent_wall_ns,
-                    **timing_metrics,
-                }
-            )
-            print(
-                json.dumps(
-                    {
-                        "event": "realtime_tts_segment",
-                        "api_key_id": key_id,
-                        "connection_id": connection_id,
-                        "segment_id": segment_id,
-                        "trigger_reason": trigger_reason,
-                        "text_characters": len(text),
-                        "input_bytes": input_bytes,
-                        "output_bytes": output_bytes,
-                        "output_chunks": output_chunks,
-                        **timing_metrics,
-                        "wall_time_ns": completed_ns,
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-
-        async def generate_audio() -> None:
-            while True:
-                item = await segment_queue.get()
-                if item is None:
-                    await send_json(
-                        {
-                            "type": "final",
-                            "segments_completed": segments_completed,
-                            "audio_bytes": audio_bytes_sent,
-                        }
-                    )
-                    async with send_lock:
-                        await websocket.close(code=1000)
-                    return
-                if item["kind"] == "flush":
-                    await send_json(
-                        {
-                            "type": "flush_done",
-                            "context_id": item["context_id"],
-                        }
-                    )
-                    continue
-                segment_id = int(item["segment_id"])
-                text = str(item["text"])
-                enqueued_ns = int(item["enqueued_ns"])
-                websocket_receive_wall_ns = int(item["websocket_receive_wall_ns"])
-                websocket_receive_monotonic_ns = int(item["websocket_receive_monotonic_ns"])
-                context_id = str(item["context_id"]) if item["context_id"] is not None else None
-                trigger_reason = str(item["trigger_reason"])
-                first_text_receive_wall_ns = int(item["first_text_receive_wall_ns"])
-                first_text_receive_monotonic_ns = int(item["first_text_receive_monotonic_ns"])
-                try:
-                    await synthesize_segment(
-                        segment_id,
-                        text,
-                        enqueued_ns,
-                        context_id,
-                        trigger_reason,
-                        websocket_receive_wall_ns,
-                        websocket_receive_monotonic_ns,
-                        first_text_receive_wall_ns,
-                        first_text_receive_monotonic_ns,
-                    )
-                except Exception as exc:
-                    await send_json(
-                        {
-                            "type": "error",
-                            "error": "generation_failed",
-                            "segment_id": segment_id,
-                        }
-                    )
-                    print(
-                        json.dumps(
-                            {
-                                "event": "realtime_tts_error",
-                                "api_key_id": key_id,
-                                "connection_id": connection_id,
-                                "segment_id": segment_id,
-                                "error_type": type(exc).__name__,
-                                "wall_time_ns": time.time_ns(),
-                            },
-                            separators=(",", ":"),
-                            sort_keys=True,
-                        ),
-                        flush=True,
-                    )
-                    async with send_lock:
-                        await websocket.close(code=1011, reason="Generation failed")
-                    raise
-
         print(
             json.dumps(
                 {
                     "event": "realtime_websocket_connection",
                     "phase": "open",
                     "handshake_status": "accepted",
-                    "emit_segment_started": emit_segment_started,
-                    "first_segment_max_wait_ms": first_segment_max_wait_ms,
+                    "split_granularity": "clause",
                     "api_key_id": key_id,
                     "active_connections": active_connections,
                     "max_connections": max_connections,
@@ -2536,42 +2185,50 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
             ),
             flush=True,
         )
-        await send_json(
-            {
-                "type": "ready",
-                "connection_id": connection_id,
-                "emit_segment_started": emit_segment_started,
-                "first_segment_max_wait_ms": first_segment_max_wait_ms,
-                "sample_rate": OUTPUT_SAMPLE_RATE,
-                "channels": 1,
-                "encoding": "pcm_s16le",
-            }
-        )
-
-        receiver_task = asyncio.create_task(receive_text())
-        generator_task = asyncio.create_task(generate_audio())
         try:
-            done, _pending = await asyncio.wait(
-                {receiver_task, generator_task},
-                return_when=asyncio.FIRST_COMPLETED,
+            segments_completed, audio_bytes_sent = await relay_native_clause(
+                websocket,
+                voice_id=voice_id,
+                language=language,
+                inactivity_timeout=inactivity_timeout,
+                emit_segment_started=emit_segment_started,
+                key_id=key_id,
+                connection_id=connection_id,
             )
-            if generator_task in done:
-                generator_task.result()
-                if not receiver_task.done():
-                    receiver_task.cancel()
-            else:
-                receiver_task.result()
-                await generator_task
         except WebSocketDisconnect:
             pass
+        except Exception as exc:  # noqa: BLE001
+            print(
+                json.dumps(
+                    {
+                        "event": "realtime_tts_error",
+                        "api_key_id": key_id,
+                        "connection_id": connection_id,
+                        "error_type": type(exc).__name__,
+                        "wall_time_ns": time.time_ns(),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            try:
+                await websocket.send_json({"type": "error", "error": "generation_failed"})
+                await websocket.close(code=1011, reason="Generation failed")
+            except Exception as close_exc:  # noqa: BLE001
+                print(
+                    json.dumps(
+                        {
+                            "event": "realtime_websocket_close_error",
+                            "connection_id": connection_id,
+                            "error_type": type(close_exc).__name__,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
         finally:
-            tasks = [receiver_task, generator_task]
-            if text_receive_task is not None:
-                tasks.append(text_receive_task)
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             await release_websocket_api_key(websocket, key_id)
             print(
                 json.dumps(
@@ -2583,8 +2240,7 @@ def _build_api(stage_overrides: str, *, log_stage_utilization: bool = False):
                         "segments_completed": segments_completed,
                         "audio_bytes": audio_bytes_sent,
                         "connection_lifetime_ms": round(
-                            (time.time_ns() - opened_ns) / 1_000_000,
-                            3,
+                            (time.time_ns() - opened_ns) / 1_000_000, 3
                         ),
                         "wall_time_ns": time.time_ns(),
                     },

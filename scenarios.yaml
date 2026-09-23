@@ -4,17 +4,49 @@ benchmark:
   # A blank value disables that threshold. Rates are percentages, latencies are milliseconds.
   thresholds:
     retry_rate_pct_max:
+    # Percentage of calls with any error. A long call has many turns, so this is much
+    # stricter than turn_failure_rate_pct_max.
     final_failure_rate_pct_max:
-    playable_ttfa_p95_ms_max:
-    playable_ttfa_p99_ms_max:
+    # Percentage of turns that failed (error, timeout, or no audible audio).
+    turn_failure_rate_pct_max:
+    # Playable TTFA percentiles count failed turns as slower than every success, and need
+    # at least 20 / 100 / 1000 turns for p95 / p99 / p99.9.
+    playable_ttfa_p95_ms_max: 500
+    playable_ttfa_p99_ms_max: 600
     playable_ttfa_p99_9_ms_max:
     # Percentage of turns with a simulated playback underrun over 20 ms.
-    playback_gap_rate_pct_max:
+    playback_gap_rate_pct_max: 0.1
     rtf_p95_max:
     request_rate_achievement_pct_min:
 
+# How simulated callers behave between bot turns. These are assumptions; replace them
+# with numbers from real call logs when you have them.
+call_timing:
+  # Time from the end of bot playback until the next user turn is sent: the caller
+  # speaking plus endpointing (VAD stop and final transcript). Blank uses each turn's
+  # wait_after_seconds as the median; a number uses one median for every turn.
+  user_turn_median_seconds:
+  # Waits are lognormal (right-skewed, like real speech) with p95 = median x this ratio.
+  # 1 turns jitter off.
+  user_turn_p95_ratio: 2.5
+  user_turn_min_seconds: 0.5
+  user_turn_max_seconds: 30
+  # Poisson mode only: call lengths are lognormal around --call-duration-seconds with
+  # p95 = median x this ratio.
+  call_duration_p95_ratio: 2.0
+
+# Each call draws scenarios at random in proportion to weight. The weights sum to 100, so
+# each is a percentage of scenario picks. The mix is a starting point, not production data:
+#   45 short conversational replies
+#   27 digit-heavy (9 with numbers spelled out, 18 with raw digits and symbols)
+#   18 replies of two or three sentences
+#   10 long answers of four or more sentences
+# Compare summary.tts_text_characters from a run with production TTS text lengths and
+# adjust. {amount}, {date}, {digits:N}, {email}, {name}, {phone}, {ref} and {time} get fresh
+# random values in every call.
 scenarios:
   - name: greeting
+    weight: 10
     turns:
       - prompt: "Reply exactly with: Thank you for calling. How can I help you today?"
         wait_after_seconds: 3
@@ -24,6 +56,7 @@ scenarios:
         wait_after_seconds: 3
 
   - name: order-status
+    weight: 8
     turns:
       - prompt: "Reply exactly with: Your order has shipped and is currently in transit."
         wait_after_seconds: 4
@@ -33,6 +66,7 @@ scenarios:
         wait_after_seconds: 3
 
   - name: appointment
+    weight: 8
     turns:
       - prompt: "Reply exactly with: I can schedule your appointment for Tuesday at ten thirty in the morning."
         wait_after_seconds: 5
@@ -42,6 +76,7 @@ scenarios:
         wait_after_seconds: 3
 
   - name: payment
+    weight: 3
     turns:
       - prompt: "Reply exactly with: Your outstanding balance is one hundred twenty four dollars and fifty cents."
         wait_after_seconds: 5
@@ -51,6 +86,7 @@ scenarios:
         wait_after_seconds: 3
 
   - name: identifiers
+    weight: 3
     turns:
       - prompt: "Reply exactly with: Your reference number is A B dash one nine four two."
         wait_after_seconds: 5
@@ -60,6 +96,7 @@ scenarios:
         wait_after_seconds: 3
 
   - name: technical-support
+    weight: 8
     turns:
       - prompt: "Reply exactly with: Please restart the router and wait for the green light to stop blinking."
         wait_after_seconds: 6
@@ -69,6 +106,7 @@ scenarios:
         wait_after_seconds: 3
 
   - name: urgent-support
+    weight: 8
     turns:
       - prompt: "Reply exactly with: I understand this is urgent, and I am checking it immediately."
         wait_after_seconds: 4
@@ -78,6 +116,7 @@ scenarios:
         wait_after_seconds: 3
 
   - name: address
+    weight: 3
     turns:
       - prompt: "Reply exactly with: The delivery address is forty two Park Avenue, apartment seven B."
         wait_after_seconds: 5
@@ -87,6 +126,7 @@ scenarios:
         wait_after_seconds: 3
 
   - name: multilingual
+    weight: 3
     turns:
       - prompt: "Reply exactly with: Hello and namaste. Thank you for contacting customer support."
         wait_after_seconds: 4
@@ -96,10 +136,81 @@ scenarios:
         wait_after_seconds: 3
 
   - name: long-response
+    weight: 5
     turns:
       - prompt: "Reply exactly with: I reviewed your account, confirmed the recent transaction, and updated the contact information you provided. Everything is now ready, and no further action is required from you."
         wait_after_seconds: 7
       - prompt: "Reply exactly with: If you notice another unexpected charge, contact us with the transaction date, amount, and reference number so that we can investigate it quickly."
         wait_after_seconds: 7
       - prompt: "Reply exactly with: Thank you for your patience while we completed these checks."
+        wait_after_seconds: 3
+
+  - name: digits-payment
+    weight: 6
+    turns:
+      - prompt: "Reply exactly with: Your current balance is {amount}, and the payment is due on {date}."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: I have the card ending in {digits:4} on file. Should I charge {amount} to that card?"
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: Done. Your confirmation number is {ref}, and a receipt was sent to {email}."
+        wait_after_seconds: 3
+
+  - name: digits-contact
+    weight: 6
+    turns:
+      - prompt: "Reply exactly with: I have your phone number as {phone}. Is that still correct?"
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: Thanks. I also see the email {email} and the ZIP code {digits:5}."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: Your callback is scheduled for {date} at {time}. We will call {phone}."
+        wait_after_seconds: 3
+
+  - name: digits-order
+    weight: 6
+    turns:
+      - prompt: "Reply exactly with: Your order {ref} shipped on {date} and is now with the carrier."
+        wait_after_seconds: 4
+      - prompt: "Reply exactly with: The tracking number is {digits:12}, and delivery is expected by {time} on {date}."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: Your refund of {amount} for order {ref} will post within 5 to 7 business days."
+        wait_after_seconds: 3
+
+  - name: policy-explanation
+    weight: 7
+    turns:
+      - prompt: "Reply exactly with: I can help with that. Our return window is 30 days from the delivery date, and items need to be unused and in the original packaging. Would you like me to start a return for you?"
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: Great. I have created the return and emailed a prepaid shipping label to {email}. Once the item reaches our warehouse, the refund usually takes 3 to 5 business days to appear."
+        wait_after_seconds: 5
+      - prompt: "Reply exactly with: Is there anything else I can help you with today, {name}?"
+        wait_after_seconds: 3
+
+  - name: troubleshooting-steps
+    weight: 6
+    turns:
+      - prompt: "Reply exactly with: Let's try a quick reset. Unplug the modem and the router, wait about 30 seconds, and then plug the modem back in first. Tell me when the lights on the modem stop blinking."
+        wait_after_seconds: 7
+      - prompt: "Reply exactly with: Perfect. Now plug the router back in and give it about two minutes to start up. After that, check whether your laptop can join the network named Home {digits:4}."
+        wait_after_seconds: 7
+      - prompt: "Reply exactly with: That fixed it. If the connection drops again, call us any time, and we can send a technician as early as {date}."
+        wait_after_seconds: 3
+
+  - name: billing-explanation
+    weight: 5
+    turns:
+      - prompt: "Reply exactly with: I looked through your last three statements, {name}. The increase comes from two things. First, the promotional discount of {amount} per month ended on {date}, so your plan returned to its standard price. Second, a one-time equipment fee of {amount} was added when the new router shipped. That fee will not appear again, so next month's bill should be lower than this one."
+        wait_after_seconds: 7
+      - prompt: "Reply exactly with: I can also help lower the monthly price. There is a loyalty offer that takes {amount} off every month for the next twelve months, and it does not require a new contract. If you like, I can apply it now, and the credit will show on your next statement. You can cancel the offer at any time without a fee."
+        wait_after_seconds: 6
+      - prompt: "Reply exactly with: The loyalty offer is now active on your account. Your reference number for today's changes is {ref}."
+        wait_after_seconds: 3
+
+  - name: plan-comparison
+    weight: 5
+    turns:
+      - prompt: "Reply exactly with: Two plans fit what you described. The Basic plan costs {amount} per month and includes 10 gigabytes of data, unlimited calls, and unlimited texts. The Plus plan costs {amount} per month and includes unlimited data, international calling to 20 countries, and a free streaming subscription. Neither plan has an annual contract, and you can switch between them once per billing cycle."
+        wait_after_seconds: 7
+      - prompt: "Reply exactly with: Over the last six months you used about {digits:2} gigabytes of data per month. That is above the Basic allowance, so you would likely pay overage charges on Basic. The Plus plan would probably cost you less overall, even though its monthly price is higher."
+        wait_after_seconds: 6
+      - prompt: "Reply exactly with: I have switched you to the Plus plan starting {date}. You will get a confirmation text at {phone} in the next few minutes."
         wait_after_seconds: 3

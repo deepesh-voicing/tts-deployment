@@ -34,9 +34,9 @@ cp .env.example .env
 uv sync
 ```
 
-Fill in `OPENAI_API_KEY`, `TTS_URL`, and the correct sample rate. Edit [scenarios.yaml](scenarios.yaml) to change the ten conversations. Each prompt produces one complete LLM response and exactly one TTS HTTP request, regardless of response length. A call cycles through its scenario until its deadline, then finishes the current turn before stopping.
+Fill in `OPENAI_API_KEY`, `TTS_URL`, and the correct sample rate. Edit [scenarios.yaml](scenarios.yaml) to change the conversations, their `weight` in the traffic mix, and `call_timing`. Each prompt produces one complete LLM response and exactly one TTS HTTP request, regardless of response length. A call cycles through its scenario until its deadline, then finishes the current turn before stopping.
 
-The optional `benchmark` section in `scenarios.yaml` configures an intended TTS request rate and pass/fail thresholds. Blank values are disabled. Available thresholds cover retry and final-failure rates, playable TTFA p95/p99/p99.9, playback-gap rate, RTF p95, and achieved-versus-intended request rate.
+The optional `benchmark` section in `scenarios.yaml` configures an intended TTS request rate and pass/fail thresholds. Blank values are disabled. Available thresholds cover retry, per-call failure and per-turn failure rates, playable TTFA p95/p99/p99.9, playback-gap rate, RTF p95, and achieved-versus-intended request rate. With no thresholds set, `passed` is `null` (not judged) rather than `true`. TTFA thresholds count failed turns as slower than every success, and percentile thresholds fail when there are too few samples (20 for p95, 100 for p99, 1000 for p99.9).
 
 ## One three-minute call
 
@@ -80,16 +80,46 @@ survives beyond the ordinary 150-second HTTP boundary, run:
 uv run python websocket_soak.py --duration-seconds 180 --interval-seconds 20
 ```
 
-Every call rotates through all scenarios. Calls use different round-robin starting scenarios so
-concurrent calls do not send the same prompt sequence together. `--ramp-seconds` evenly staggers
-call starts across that window. By default, every call runs for the full requested duration. When
-`--call-duration-seconds` is set, each concurrency slot starts a replacement as soon as its current
-call ends and keeps doing so until that slot has run for `--duration-seconds`. The ramp applies only
-to the first call in each slot. A call finishes its in-flight turn before ending, so its actual
-duration can be slightly longer than its requested duration. Each phase writes:
+Each call draws scenarios at random in proportion to their `weight`, fills placeholders such as
+`{amount}`, `{phone}`, `{date}` and `{digits:4}` with fresh values, and draws each wait after bot
+playback from a lognormal distribution (`call_timing` in `scenarios.yaml`; each turn's
+`wait_after_seconds` is the median). Pass `--seed` to repeat the exact same calls; the seed used is
+written to `summary.json`.
+
+`--concurrency` runs closed mode: a fixed number of call slots. `--ramp-seconds` evenly staggers
+the first call in each slot (default 60 s or a quarter of the duration, whichever is shorter). A slot
+replaces any call that ends before `--duration-seconds`, including one that stopped after a turn
+timeout. With `--call-duration-seconds`, slots also rotate calls at that length.
+
+Poisson mode is the default when `--concurrency` is not given: calls start at random times
+averaging `--arrival-rate-per-minute` (default 15), whether or not earlier calls are still running,
+and each lasts a lognormal length with median `--call-duration-seconds` (default 180 s). Phases
+default to 1800 s. This is how real traffic arrives, so it shows where latency climbs as load
+rises. Expected active calls are rate / 60 x mean call length; `active_calls` in the summary shows
+what was measured. The first p95 call length is treated as warmup, and a phase too short to get
+past it is rejected before it starts.
+
+```bash
+uv run python load_test.py --model qwen3-tts-1.7b --arrival-rate-per-minute 16 --seed 7
+```
+
+To find capacity, sweep increasing rates. Each phase reuses one seed, so only the arrival rate
+changes. The sweep stops at the first rate that fails the thresholds in `scenarios.yaml` (pass
+`--keep-going` to run them all), prints one comparison table, and reports the highest passing rate
+as capacity. Results go to `artifacts/<timestamp>_<model>_sweep/sweep.json`, with each phase's
+folder beside it. Every other argument is passed to `load_test.py`.
+
+```bash
+uv run python capacity_sweep.py --rates 12,15,18,21,24 --model qwen3-tts-1.7b
+```
+
+A turn that exceeds `TURN_TIMEOUT_SECONDS` (default 30) ends its call immediately, instead of
+waiting for a stuck TTS request to reach `TTS_TIMEOUT_SECONDS` (default 20). A call finishes its
+in-flight turn before ending, so its actual duration can be slightly longer than its requested
+duration. Each phase writes:
 
 ```text
-artifacts/<timestamp>_<model>_c<concurrency>_<duration>s[_call<call-duration>s]_r<ramp>s/
+artifacts/<timestamp>_<model>_<c<concurrency>|poisson<rate>pm>_<duration>s[_call<call-duration>s][_r<ramp>s]/
   calls/call_0001.wav
   calls/call_0001.json
   ...
@@ -98,7 +128,7 @@ artifacts/<timestamp>_<model>_c<concurrency>_<duration>s[_call<call-duration>s]_
 
 Each `call_*.wav` is the continuous call timeline. Turn WAVs are not written; per-turn timing and tracing remain in the call JSON. Raw Pipecat metric events stay in each call JSON and are omitted from the aggregate summary to limit memory and summary-file growth.
 
-`summary.json` contains request/call counts and min/mean/p50/p95/p99/p99.9/max distributions for end-to-end TTFA, LLM latency, TTS TTFA, request time, RTF, audio-chunk inter-arrival time, playback underrun gaps, and call duration. WebSocket runs additionally report send time, client send to server receive, server receive to local vLLM send, local vLLM send to first client PCM, and socket age at each request. It also separates retried and non-retried requests, counts latency breaches, classifies failures, evaluates configured thresholds, samples process RSS and event-loop lag, and verifies that TTS sessions/connectors were closed. `inter_audio_ms` is chunk-to-chunk arrival time; `playback_gap_ms` is audible buffer-underrun time.
+`summary.json` contains request/call counts and min/mean/p50/p95/p99/p99.9/max distributions for end-to-end TTFA, LLM latency, TTS TTFA, request time, RTF, audio-chunk inter-arrival time, playback underrun gaps, and call duration. WebSocket runs additionally report send time, client send to server receive, server receive to local vLLM send, local vLLM send to first client PCM, and socket age at each request. It also separates retried and non-retried requests, counts latency breaches, classifies failures, evaluates configured thresholds, samples process RSS and event-loop lag, and verifies that TTS sessions/connectors were closed. `inter_audio_ms` is chunk-to-chunk arrival time; `playback_gap_ms` is audible buffer-underrun time that began after the TTS had the full text, and `text_pending_playback_gap_ms` holds underruns that began while the LLM was still streaming text. Summary distributions, rates and `tts_in_flight` only use turns that started while every call slot was active (from the end of the ramp to the first slot's deadline); see `steady_state`. For realtime transports `rtf` uses the server's per-segment generation time; `rtf.weighted_client_wall` keeps the old request-time ratio.
 
 Every TTS request keeps one parent `trace_id`. Each network attempt has a separate `attempt_id` and records its first, second and last body chunk plus its maximum body-chunk gap. The Modal wrapper echoes both identifiers so retries can be joined without conflating duplicate inference attempts.
 

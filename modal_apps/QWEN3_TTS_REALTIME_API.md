@@ -1,7 +1,8 @@
 # Qwen3-TTS realtime API MVP
 
 This is the contract for the isolated `tts-l40s-qwen3-tts-realtime` Modal app.
-It is implemented locally but is not deployed.
+The native clause-splitting route is deployed to all three realtime functions;
+the US-East route has been verified with authenticated 8 kHz PCM audio.
 
 ## Authentication
 
@@ -39,6 +40,9 @@ Supported query parameters:
 - `language`: optional language name or code
 - `output_format`: only `pcm_8000`
 - `inactivity_timeout`: 5-180 seconds; default 30
+- `emit_segment_started`: optional `true` or `false`; default `false`
+
+The old `first_segment_max_wait_ms` option is no longer supported (except `0`).
 
 The server first sends:
 
@@ -60,12 +64,13 @@ Audio is sent as binary 8 kHz mono PCM16 frames. JSON control events are
 
 Each `segment_done` event includes the server-side timing breakdown:
 
-- `websocket_receive_to_vllm_send_ms`
-- `vllm_send_to_first_24khz_audio_ms`
 - `first_24khz_audio_to_first_8khz_pcm_sent_ms`
-- `queue_ms`
 - `first_audio_ms`
 - `generation_ms`
+
+It also includes upstream PCM chunk-gap timings. The former local segment queue
+and its `queue_ms`/text-release timings no longer exist; vLLM does not expose
+equivalent per-segment queue timings through this WebSocket.
 
 It also includes the corresponding server wall-clock timestamps. The load-test
 client stores every segment record and combines the first segment with its own
@@ -77,15 +82,15 @@ on clock synchronization.
 sent. The connection remains open for the next utterance. Send `close` only
 when the call is ending; the server then sends `final` and closes the socket.
 
-`flush:true` sends all buffered text to Qwen. Otherwise, complete sentences are
-sent automatically and long text is split at a word boundary near 160
-characters. Qwen is called with `stream=true`, and segments are generated one at
-a time so audio remains ordered.
+Partial text is forwarded to vLLM-Omni v0.29.0rc1's native text-input
+WebSocket with `split_granularity="clause"` and `stream_audio=true`.
+vLLM—not this API—decides clause boundaries. `flush:true` sends vLLM
+`input.done` to release any remainder while keeping the connection open.
+vLLM emits 24 kHz PCM; this API resamples it once to 8 kHz for the client.
 
 ## MVP limits
 
-- Four queued segments per connection
-- 4,096 buffered characters
+- 4,096 characters per utterance
 - 64 KiB maximum control message
 - Manual hashed API keys
 - One Modal container, so per-key connection counters are process-local
