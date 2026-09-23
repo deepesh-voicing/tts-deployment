@@ -2,10 +2,14 @@
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import time
 from collections import defaultdict
+
+_BATCH_STAT_FIELDS = ("forwards", "groups", "requests", "padded_frames", "decoded_frames")
+_CONTAINER_ID_RE = re.compile(r"\bta-[A-Za-z0-9]+\b")
 
 
 def _json_event(line: str) -> dict[str, object] | None:
@@ -33,6 +37,10 @@ def _stage_summary(event: dict[str, object]) -> dict[str, object]:
             histograms = {}
         queue = histograms.get("request_queue_time_seconds")
         e2e = histograms.get("e2e_request_latency_seconds")
+        prefill = histograms.get("request_prefill_time_seconds")
+        decode = histograms.get("request_decode_time_seconds")
+        iteration = histograms.get("iteration_tokens")
+        inter_token = histograms.get("inter_token_latency_seconds")
         result[stage_id] = {
             "running": stage.get("running_requests"),
             "waiting": stage.get("waiting_requests"),
@@ -40,6 +48,20 @@ def _stage_summary(event: dict[str, object]) -> dict[str, object]:
             "reported_slot_pct": stage.get("sequence_slot_utilization_pct"),
             "kv_pct": stage.get("kv_cache_utilization_pct"),
             "queue_mean_s": queue.get("mean") if isinstance(queue, dict) else None,
+            "queue_p95_upper_bound_s": (
+                queue.get("p95_upper_bound") if isinstance(queue, dict) else None
+            ),
+            "prefill_mean_s": prefill.get("mean") if isinstance(prefill, dict) else None,
+            "decode_mean_s": decode.get("mean") if isinstance(decode, dict) else None,
+            "inter_token_mean_s": (
+                inter_token.get("mean") if isinstance(inter_token, dict) else None
+            ),
+            "iteration_tokens_mean": (
+                iteration.get("mean") if isinstance(iteration, dict) else None
+            ),
+            "iteration_tokens_p95_upper_bound": (
+                iteration.get("p95_upper_bound") if isinstance(iteration, dict) else None
+            ),
             "e2e_mean_s": e2e.get("mean") if isinstance(e2e, dict) else None,
             "preemptions_total": stage.get("preemptions_total"),
         }
@@ -58,6 +80,42 @@ def _active_request_count(event: dict[str, object]) -> float:
     )
 
 
+def _code2wav_batch_counters(line: str) -> dict[str, int] | None:
+    marker = "Code2Wav batch stats:"
+    if marker not in line:
+        return None
+    payload = line.split(marker, 1)[1]
+    counters = {}
+    for field in _BATCH_STAT_FIELDS:
+        match = re.search(rf"(?:^|\s){field}=(\d+)(?:\s|$)", payload)
+        if match is None:
+            return None
+        counters[field] = int(match.group(1))
+    return counters
+
+
+def _code2wav_batch_window(
+    baseline: dict[str, int], current: dict[str, int]
+) -> dict[str, object] | None:
+    delta = {field: current[field] - baseline[field] for field in _BATCH_STAT_FIELDS}
+    if any(value < 0 for value in delta.values()) or delta["forwards"] == 0:
+        return None
+    forwards = delta["forwards"]
+    groups = delta["groups"]
+    decoded_frames = delta["decoded_frames"]
+    return {
+        "forwards": forwards,
+        "decode_items": delta["requests"],
+        "decoder_groups": groups,
+        "decode_items_per_forward": round(delta["requests"] / forwards, 3),
+        "decode_items_per_group": (round(delta["requests"] / groups, 3) if groups else None),
+        "groups_per_forward": round(groups / forwards, 3),
+        "padding_pct": (
+            round(100 * delta["padded_frames"] / decoded_frames, 3) if decoded_frames else None
+        ),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--app", default="tts-l40s-qwen3-tts")
@@ -68,7 +126,15 @@ def main() -> int:
 
     modal_cli = shutil.which("modal") or "/opt/homebrew/bin/modal"
     process = subprocess.Popen(
-        [modal_cli, "app", "logs", args.app, "--follow", "--timestamps"],
+        [
+            modal_cli,
+            "app",
+            "logs",
+            args.app,
+            "--follow",
+            "--timestamps",
+            "--show-container-id",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -83,6 +149,10 @@ def main() -> int:
     latest_stage = None
     latest_gpu = None
     latest_graph = None
+    latest_decode_batch = None
+    latest_decode_batch_window = None
+    batch_baselines: dict[str, dict[str, int]] = {}
+    stage_overrides = None
     baseline_success = None
     timing = defaultdict(float)
 
@@ -108,6 +178,8 @@ def main() -> int:
                         idle_since = now
                 elif event_name == "gpu_device_utilization":
                     latest_gpu = event
+                elif event_name == "vllm_stage_utilization_config":
+                    stage_overrides = event.get("stage_overrides")
                 elif event_name == "tts_timeline":
                     phase = event.get("phase")
                     if phase == "request_body_received":
@@ -123,6 +195,19 @@ def main() -> int:
 
             if "Segmented Code2Wav CUDA Graph stats:" in line:
                 latest_graph = line.split("Segmented Code2Wav CUDA Graph stats:", 1)[1].strip()
+            if "Code2Wav batch stats:" in line:
+                latest_decode_batch = line.split("Code2Wav batch stats:", 1)[1].strip()
+                counters = _code2wav_batch_counters(line)
+                container_match = _CONTAINER_ID_RE.search(line)
+                if counters is not None and container_match is not None:
+                    container_id = container_match.group()
+                    baseline = batch_baselines.setdefault(container_id, counters)
+                    window = _code2wav_batch_window(baseline, counters)
+                    if window is None and counters != baseline:
+                        batch_baselines[container_id] = counters
+                    latest_decode_batch_window = (
+                        {"container_id": container_id, **window} if window is not None else None
+                    )
 
             if (
                 latest_stage is not None
@@ -150,6 +235,7 @@ def main() -> int:
                     ),
                     "requests_success_total": success,
                     "stages": _stage_summary(latest_stage),
+                    "stage_overrides": stage_overrides,
                     "gpu": {
                         "compute_pct": device.get("compute_utilization_pct"),
                         "memory_controller_pct": device.get(
@@ -174,6 +260,9 @@ def main() -> int:
                         "request_errors": int(timing["request_errors"]),
                     },
                     "latest_code2wav_graph_stats": latest_graph,
+                    "latest_code2wav_batch_stats": latest_decode_batch,
+                    "stage1_decoder_batch_since_first_sample": latest_decode_batch_window,
+                    "stage1_pre_scheduler_ready_queue_observed": False,
                 }
                 print(json.dumps(summary, separators=(",", ":")), flush=True)
                 last_report = now

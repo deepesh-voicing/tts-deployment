@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import sys
 import time
 from datetime import UTC, datetime
@@ -84,6 +85,14 @@ def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
 
 
+async def _apply_wav_retention(result: dict, retention_percent: float) -> None:
+    retained = retention_percent >= 100 or random.random() < retention_percent / 100
+    result["recording_retained"] = retained
+    if retained or not result.get("recording"):
+        return
+    await asyncio.to_thread(Path(result["recording"]).unlink, missing_ok=True)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     load_dotenv()
     parser = argparse.ArgumentParser(description="Run concurrent local Pipecat scenario calls")
@@ -102,6 +111,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ramp-seconds", type=float, default=0.0)
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
     parser.add_argument(
+        "--wav-retention-percent",
+        type=float,
+        default=100.0,
+        help="Random percentage of completed-call WAV files to retain",
+    )
+    parser.add_argument(
         "--modal-average-containers",
         type=float,
         default=_optional_float(os.getenv("MODAL_AVERAGE_CONTAINERS")),
@@ -117,6 +132,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--call-duration-seconds must be positive")
     if args.ramp_seconds < 0:
         parser.error("--ramp-seconds cannot be negative")
+    if not 0 <= args.wav_retention_percent <= 100:
+        parser.error("--wav-retention-percent must be between 0 and 100")
     if args.modal_average_containers is not None and args.modal_average_containers <= 0:
         parser.error("--modal-average-containers must be positive")
     return args
@@ -127,18 +144,15 @@ async def async_main(args: argparse.Namespace) -> tuple[Path, bool]:
     scenarios = load_scenarios(args.scenarios)
     benchmark_config = load_benchmark_config(args.scenarios)
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    output_dir = (
-        args.output_dir
-        / (
-            f"{timestamp}_{_slug(config.model)}_c{args.concurrency}_"
-            f"{int(args.duration_seconds)}s"
-            + (
-                f"_call{args.call_duration_seconds:g}s"
-                if args.call_duration_seconds is not None
-                else ""
-            )
-            + f"_r{args.ramp_seconds:g}s"
+    output_dir = args.output_dir / (
+        f"{timestamp}_{_slug(config.model)}_c{args.concurrency}_"
+        f"{int(args.duration_seconds)}s"
+        + (
+            f"_call{args.call_duration_seconds:g}s"
+            if args.call_duration_seconds is not None
+            else ""
         )
+        + f"_r{args.ramp_seconds:g}s"
     )
     calls_dir = output_dir / "calls"
     calls_dir.mkdir(parents=True, exist_ok=False)
@@ -194,6 +208,7 @@ async def async_main(args: argparse.Namespace) -> tuple[Path, bool]:
                     output_dir=calls_dir,
                 )
                 result.pop("pipecat_metrics", None)
+                await _apply_wav_retention(result, args.wav_retention_percent)
                 return [result], []
             except Exception as error:  # noqa: BLE001
                 return [], [{"call_id": slot_id, "slot_id": slot_id, "error": str(error)}]
@@ -217,11 +232,10 @@ async def async_main(args: argparse.Namespace) -> tuple[Path, bool]:
                     output_dir=calls_dir,
                 )
                 result.pop("pipecat_metrics", None)
+                await _apply_wav_retention(result, args.wav_retention_percent)
                 slot_calls.append(result)
             except Exception as error:  # noqa: BLE001
-                slot_errors.append(
-                    {"call_id": call_id, "slot_id": slot_id, "error": str(error)}
-                )
+                slot_errors.append({"call_id": call_id, "slot_id": slot_id, "error": str(error)})
 
             if time.perf_counter() >= slot_deadline:
                 break
@@ -230,8 +244,7 @@ async def async_main(args: argparse.Namespace) -> tuple[Path, bool]:
         return slot_calls, slot_errors
 
     tasks = [
-        asyncio.create_task(run_call_slot(slot_id))
-        for slot_id in range(1, args.concurrency + 1)
+        asyncio.create_task(run_call_slot(slot_id)) for slot_id in range(1, args.concurrency + 1)
     ]
     try:
         slot_results = await asyncio.gather(*tasks)
@@ -268,12 +281,14 @@ async def async_main(args: argparse.Namespace) -> tuple[Path, bool]:
     )
     report["ramp_seconds"] = args.ramp_seconds
     report["call_duration_seconds"] = args.call_duration_seconds
+    report["wav_retention_percent"] = args.wav_retention_percent
     report["call_sessions_started"] = len(calls) + len(harness_errors)
     report["harness_errors"] = harness_errors
     report_path = output_dir / "summary.json"
     await asyncio.to_thread(_write_json, report_path, report)
 
     print(json.dumps(report["summary"], indent=2))
+    print(json.dumps(report["playback_gaps"], indent=2))
     print(json.dumps(report["cost"], indent=2))
     print(json.dumps(report["failure_breakdown"], indent=2))
     print(json.dumps(report["thresholds"], indent=2))

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import math
 import os
+import random
 import re
 import statistics
 import struct
@@ -17,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import yaml
@@ -48,6 +50,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.responses.llm import OpenAIResponsesHttpLLMService
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TextAggregationMode, TTSService
 from pipecat.utils.text.base_text_aggregator import Aggregation, BaseTextAggregator
@@ -62,10 +65,17 @@ MODEL_NAMES = (
     "higgs-audio-v3",
     "moss-tts",
     "moss-tts-realtime",
+    "elevenlabs",
 )
 
 TTS_RESPONSE_HEADER_TIMEOUT_SECONDS = 10.0
+QWEN_APPLICATION_PING_INTERVAL_SECONDS = 10.0
+QWEN_INACTIVITY_TIMEOUT_SECONDS = 180
+QWEN_WEBSOCKET_CONNECT_TIMEOUT_SECONDS = 15.0
+QWEN_WEBSOCKET_CONNECT_ATTEMPTS = 2
+QWEN_WEBSOCKET_RETRY_JITTER_SECONDS = (0.25, 0.75)
 TRANSPORT_STALL_THRESHOLD_SECONDS = 1.0
+PLAYBACK_GAP_REPORT_THRESHOLD_MS = 20.0
 TAIL_THRESHOLDS_MS = (1_000, 2_000, 10_000, 30_000)
 BENCHMARK_THRESHOLD_KEYS = {
     "retry_rate_pct_max",
@@ -218,6 +228,10 @@ class TTSRequest:
     max_body_chunk_gap_seconds: float = 0.0
     body_chunk_count: int = 0
     body_bytes: int = 0
+    first_chunk_processing_seconds: float | None = None
+    max_chunk_processing_seconds: float = 0.0
+    first_chunk_metrics_push_seconds: float | None = None
+    max_chunk_metrics_push_seconds: float = 0.0
     audio_bytes: int = 0
     first_playable_at: float | None = None
     first_playable_wall_ns: int | None = None
@@ -255,6 +269,7 @@ class RealtimeTTSContext:
     completed: asyncio.Event = field(default_factory=asyncio.Event)
     audio_context_closed: bool = False
     error: Exception | None = None
+    error_reported: bool = False
 
 
 @dataclass
@@ -782,9 +797,7 @@ class ModalTTSService(TTSService):
             request.modal_handler_entry_wall_ns = receive_wall_ns
             request.modal_websocket_receive_wall_ns = receive_wall_ns
             request.websocket_connection_id = event.get("connection_id")
-            request.websocket_request_on_connection = event.get(
-                "request_on_connection"
-            )
+            request.websocket_request_on_connection = event.get("request_on_connection")
             attempt.modal_attempt_id = attempt_id
             attempt.modal_websocket_receive_wall_ns = receive_wall_ns
         elif event.get("type") == "ready":
@@ -952,8 +965,7 @@ class ModalTTSService(TTSService):
                         break
                     except Exception as exc:
                         no_response = (
-                            attempt.response_headers_at is None
-                            and attempt.first_body_at is None
+                            attempt.response_headers_at is None and attempt.first_body_at is None
                         )
                         retryable = no_response and isinstance(
                             exc,
@@ -1140,6 +1152,9 @@ class ModalTTSService(TTSService):
 class QwenRealtimeTTSService(TTSService):
     """Streams all turns in one simulated call over one authenticated socket."""
 
+    transport_name = "realtime_websocket"
+    defer_final_text_for_flush = False
+
     def __init__(self, config: BotConfig, state: CallState):
         super().__init__(
             name=f"tts:{config.model}",
@@ -1161,6 +1176,8 @@ class QwenRealtimeTTSService(TTSService):
         self._session: aiohttp.ClientSession | None = None
         self._websocket: aiohttp.ClientWebSocketResponse | None = None
         self._receiver_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
+        self._last_application_send_at = 0.0
         self._final_received = asyncio.Event()
         self._context: RealtimeTTSContext | None = None
         self._connection_started_at: float | None = None
@@ -1169,6 +1186,7 @@ class QwenRealtimeTTSService(TTSService):
         self._connection_id: str | None = None
         self._requests_on_connection = 0
         self._connection_error: Exception | None = None
+        self._connection_error_at: float | None = None
 
     @property
     def supports_processing_metrics(self) -> bool:
@@ -1176,6 +1194,18 @@ class QwenRealtimeTTSService(TTSService):
 
     def can_generate_metrics(self) -> bool:
         return True
+
+    @property
+    def connection_error(self) -> Exception | None:
+        return self._connection_error
+
+    @property
+    def connection_error_at(self) -> float | None:
+        return self._connection_error_at
+
+    @staticmethod
+    def _is_transport_error(exc: Exception) -> bool:
+        return isinstance(exc, (TimeoutError, aiohttp.ClientError, OSError))
 
     @staticmethod
     def _realtime_websocket_url(
@@ -1191,16 +1221,16 @@ class QwenRealtimeTTSService(TTSService):
             url = "ws://" + url.removeprefix("http://")
         elif not url.startswith(("ws://", "wss://")):
             raise ValueError("Realtime WebSocket TTS URL must use http(s) or ws(s)")
+        parts = urlsplit(url)
         query: dict[str, str | int] = {
             "output_format": "pcm_8000",
-            "inactivity_timeout": 30,
+            "inactivity_timeout": QWEN_INACTIVITY_TIMEOUT_SECONDS,
         }
+        query.update(parse_qsl(parts.query))
         if language:
             query["language"] = language
-        return (
-            f"{url}/v1/text-to-speech/{quote(voice, safe='')}/stream-input"
-            f"?{urlencode(query)}"
-        )
+        path = f"{parts.path.rstrip('/')}/v1/text-to-speech/{quote(voice, safe='')}/stream-input"
+        return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), ""))
 
     async def start(self, frame):
         await super().start(frame)
@@ -1211,7 +1241,14 @@ class QwenRealtimeTTSService(TTSService):
         )
         _TTS_SESSIONS_CREATED += 1
         _TTS_SESSIONS_ACTIVE += 1
-        await self._connect()
+        try:
+            await self._connect()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - retry again when the first turn starts
+            self._connection_error = exc
+            self._connection_error_at = time.perf_counter()
+            logger.warning("Initial realtime WebSocket connection failed: {}", exc)
 
     async def stop(self, frame):
         await super().stop(frame)
@@ -1231,60 +1268,151 @@ class QwenRealtimeTTSService(TTSService):
         if not self._config.tts_voice:
             raise RuntimeError("Realtime WebSocket TTS requires --tts-voice")
 
+        await self._stop_keepalive()
+        if self._websocket is not None and not self._websocket.closed:
+            await self._websocket.close()
+        if self._receiver_task is not None:
+            self._receiver_task.cancel()
+            await asyncio.gather(self._receiver_task, return_exceptions=True)
+        self._websocket = None
+        self._receiver_task = None
+
         headers = (
             {"Authorization": f"Bearer {self._config.tts_bearer_token}"}
             if self._config.tts_bearer_token
             else None
         )
-        started_at = time.perf_counter()
-        websocket = await self._session.ws_connect(
-            self._realtime_websocket_url(
-                self._config.tts_url,
-                voice=self._config.tts_voice,
-                language=self._config.tts_language,
-            ),
-            headers=headers,
-            heartbeat=15.0,
-            autoping=True,
+        url = self._realtime_websocket_url(
+            self._config.tts_url,
+            voice=self._config.tts_voice,
+            language=self._config.tts_language,
         )
-        try:
-            message = await asyncio.wait_for(
-                websocket.receive(),
-                timeout=min(
-                    TTS_RESPONSE_HEADER_TIMEOUT_SECONDS,
-                    self._config.tts_timeout_seconds,
-                ),
-            )
-            if message.type != aiohttp.WSMsgType.TEXT:
-                raise RuntimeError("Expected realtime WebSocket ready event")
-            event = json.loads(message.data)
-            if event.get("type") != "ready":
-                raise RuntimeError(f"Expected ready, received {event!r}")
-            if (
-                int(event.get("sample_rate", 0)) != 8_000
-                or int(event.get("channels", 0)) != 1
-                or event.get("encoding") != "pcm_s16le"
-            ):
-                raise RuntimeError(f"Unsupported realtime audio format: {event!r}")
-        except BaseException:
-            await websocket.close()
-            raise
+        started_at = time.perf_counter()
+        event: dict[str, Any] | None = None
+        websocket: aiohttp.ClientWebSocketResponse | None = None
+        for attempt_number in range(1, QWEN_WEBSOCKET_CONNECT_ATTEMPTS + 1):
+            try:
+                websocket = await asyncio.wait_for(
+                    self._session.ws_connect(
+                        url,
+                        headers=headers,
+                        heartbeat=15.0,
+                        autoping=True,
+                    ),
+                    timeout=min(
+                        QWEN_WEBSOCKET_CONNECT_TIMEOUT_SECONDS,
+                        self._config.tts_timeout_seconds,
+                    ),
+                )
+                message = await asyncio.wait_for(
+                    websocket.receive(),
+                    timeout=min(
+                        TTS_RESPONSE_HEADER_TIMEOUT_SECONDS,
+                        self._config.tts_timeout_seconds,
+                    ),
+                )
+                if message.type != aiohttp.WSMsgType.TEXT:
+                    raise aiohttp.ClientConnectionError("Realtime WebSocket closed before ready")
+                event = json.loads(message.data)
+                if event.get("type") != "ready":
+                    raise RuntimeError(f"Expected ready, received {event!r}")
+                if (
+                    int(event.get("sample_rate", 0)) != 8_000
+                    or int(event.get("channels", 0)) != 1
+                    or event.get("encoding") != "pcm_s16le"
+                ):
+                    raise RuntimeError(f"Unsupported realtime audio format: {event!r}")
+                break
+            except asyncio.CancelledError:
+                if websocket is not None:
+                    await websocket.close()
+                raise
+            except Exception as exc:
+                if websocket is not None:
+                    await websocket.close()
+                    websocket = None
+                if (
+                    attempt_number >= QWEN_WEBSOCKET_CONNECT_ATTEMPTS
+                    or not self._is_transport_error(exc)
+                ):
+                    self._connection_error = exc
+                    self._connection_error_at = time.perf_counter()
+                    raise
+                jitter_seconds = random.uniform(*QWEN_WEBSOCKET_RETRY_JITTER_SECONDS)
+                logger.warning(
+                    "Realtime WebSocket connection attempt {} failed; retrying in {:.2f}s: {}",
+                    attempt_number,
+                    jitter_seconds,
+                    exc,
+                )
+                await asyncio.sleep(jitter_seconds)
+
+        if websocket is None or event is None:
+            raise RuntimeError("Realtime WebSocket connection did not become ready")
 
         self._websocket = websocket
         self._connection_started_at = started_at
         self._connection_ready_at = time.perf_counter()
         self._connection_ready_wall_ns = time.time_ns()
         self._connection_id = (
-            str(event["connection_id"])
-            if event.get("connection_id") is not None
-            else None
+            str(event["connection_id"]) if event.get("connection_id") is not None else None
         )
         self._requests_on_connection = 0
         self._connection_error = None
+        self._connection_error_at = None
         self._final_received.clear()
+        self._last_application_send_at = time.perf_counter()
         self._receiver_task = asyncio.create_task(self._receive_audio())
+        inactivity_timeout = float(dict(parse_qsl(urlsplit(url).query))["inactivity_timeout"])
+        ping_interval = min(QWEN_APPLICATION_PING_INTERVAL_SECONDS, inactivity_timeout / 3)
+        self._keepalive_task = asyncio.create_task(self._send_idle_pings(websocket, ping_interval))
+
+    async def _stop_keepalive(self) -> None:
+        task = self._keepalive_task
+        self._keepalive_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _send_idle_pings(
+        self, websocket: aiohttp.ClientWebSocketResponse, interval: float
+    ) -> None:
+        # Protocol heartbeats do not reset the server's application-message timer.
+        try:
+            while self._websocket is websocket and not websocket.closed:
+                remaining = max(
+                    0.0, self._last_application_send_at + interval - time.perf_counter()
+                )
+                try:
+                    await asyncio.wait_for(self._final_received.wait(), timeout=remaining)
+                    return
+                except TimeoutError:
+                    pass
+                if self._final_received.is_set() or websocket.closed:
+                    return
+                if time.perf_counter() - self._last_application_send_at < interval:
+                    continue
+                await websocket.send_json({"type": "ping"})
+                self._last_application_send_at = time.perf_counter()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - let the receiver fail any active turn
+            self._connection_error = exc
+            self._connection_error_at = time.perf_counter()
+            logger.debug("Realtime WebSocket application keepalive failed: {}", exc)
+            await websocket.close()
+
+    async def _discard_websocket(self, exc: Exception) -> None:
+        self._connection_error = exc
+        self._connection_error_at = time.perf_counter()
+        websocket = self._websocket
+        self._websocket = None
+        self._final_received.set()
+        if websocket is not None and not websocket.closed:
+            await websocket.close()
 
     async def _close(self, *, graceful: bool) -> None:
+        await self._stop_keepalive()
         websocket = self._websocket
         receiver_task = self._receiver_task
         self._context = None
@@ -1311,16 +1439,33 @@ class QwenRealtimeTTSService(TTSService):
         await _close_tracked_tts_session(session)
 
     async def on_turn_context_created(self, context_id: str):
+        if self._context is not None:
+            raise RuntimeError("Previous realtime TTS context is still active")
+        context = RealtimeTTSContext(context_id=context_id)
+        self._context = context
         if (
             self._websocket is None
             or self._websocket.closed
             or self._receiver_task is None
             or self._receiver_task.done()
         ):
-            await self._connect()
-        if self._context is not None:
-            raise RuntimeError("Previous realtime TTS context is still active")
-        self._context = RealtimeTTSContext(context_id=context_id)
+            try:
+                await self._connect()
+            except asyncio.CancelledError:
+                self._context = None
+                raise
+            except Exception as exc:  # noqa: BLE001 - fail this turn, reconnect next turn
+                context.error = exc
+
+    @staticmethod
+    def _error_frame(context: RealtimeTTSContext) -> ErrorFrame | None:
+        if context.error is None or context.error_reported:
+            return None
+        context.error_reported = True
+        return ErrorFrame(
+            error=f"Realtime TTS request failed: {context.error}",
+            exception=context.error,
+        )
 
     def _ensure_request(self, context: RealtimeTTSContext) -> tuple[TTSRequest, TTSAttempt]:
         if context.request is not None and context.attempt is not None:
@@ -1335,14 +1480,12 @@ class QwenRealtimeTTSService(TTSService):
 
         request = self._state.begin_tts_request(
             context.full_text,
-            transport="realtime_websocket",
+            transport=self.transport_name,
         )
         attempt = ModalTTSService._start_attempt(request)
         connection_reused = self._requests_on_connection > 0
         connection_seconds = (
-            0.0
-            if connection_reused
-            else self._connection_ready_at - self._connection_started_at
+            0.0 if connection_reused else self._connection_ready_at - self._connection_started_at
         )
         for target in (request, attempt):
             target.connection_reused = connection_reused
@@ -1382,6 +1525,7 @@ class QwenRealtimeTTSService(TTSService):
                 "flush": flush,
             }
         )
+        self._last_application_send_at = time.perf_counter()
         if first_send:
             ModalTTSService._record_websocket_send_complete(request, attempt)
 
@@ -1420,17 +1564,23 @@ class QwenRealtimeTTSService(TTSService):
 
         timing: dict[str, Any] = {
             "segment_id": event.get("segment_id"),
+            "trigger_reason": event.get("trigger_reason"),
             "text_characters": event.get("text_characters"),
             "output_bytes": event.get("output_bytes"),
             "output_chunks": event.get("output_chunks"),
         }
         for field_name in (
+            "first_text_receive_to_segment_enqueue_ms",
+            "segment_enqueue_to_vllm_send_ms",
             "websocket_receive_to_vllm_send_ms",
             "vllm_send_to_first_24khz_audio_ms",
             "first_24khz_audio_to_first_8khz_pcm_sent_ms",
             "queue_ms",
             "first_audio_ms",
             "generation_ms",
+            "upstream_pcm_first_to_second_chunk_ms",
+            "upstream_pcm_mean_chunk_gap_ms",
+            "upstream_pcm_max_chunk_gap_ms",
         ):
             value = event.get(field_name)
             timing[field_name] = (
@@ -1439,6 +1589,7 @@ class QwenRealtimeTTSService(TTSService):
                 else None
             )
         for field_name in (
+            "first_text_receive_wall_ns",
             "websocket_receive_wall_ns",
             "vllm_request_sent_wall_ns",
             "first_24khz_audio_wall_ns",
@@ -1468,6 +1619,7 @@ class QwenRealtimeTTSService(TTSService):
                     return
                 message = await websocket.receive()
                 if message.type == aiohttp.WSMsgType.BINARY:
+                    chunk_processing_started_at = time.perf_counter()
                     chunk = bytes(message.data)
                     if not chunk:
                         continue
@@ -1476,12 +1628,15 @@ class QwenRealtimeTTSService(TTSService):
                     context = self._context
                     if context is None or context.request is None or context.attempt is None:
                         raise RuntimeError("Realtime audio arrived without an active utterance")
+                    is_first_chunk = context.request.body_chunk_count == 0
                     self._state.received_tts_body(
                         context.request,
                         context.attempt,
                         len(chunk),
                     )
+                    metrics_push_started_at = time.perf_counter()
                     await self.stop_ttfb_metrics()
+                    metrics_push_seconds = time.perf_counter() - metrics_push_started_at
                     await self.append_to_audio_context(
                         context.context_id,
                         TTSAudioRawFrame(
@@ -1490,6 +1645,18 @@ class QwenRealtimeTTSService(TTSService):
                             num_channels=1,
                             context_id=context.context_id,
                         ),
+                    )
+                    chunk_processing_seconds = time.perf_counter() - chunk_processing_started_at
+                    if is_first_chunk:
+                        context.request.first_chunk_processing_seconds = chunk_processing_seconds
+                        context.request.first_chunk_metrics_push_seconds = metrics_push_seconds
+                    context.request.max_chunk_processing_seconds = max(
+                        context.request.max_chunk_processing_seconds,
+                        chunk_processing_seconds,
+                    )
+                    context.request.max_chunk_metrics_push_seconds = max(
+                        context.request.max_chunk_metrics_push_seconds,
+                        metrics_push_seconds,
                     )
                     continue
                 if message.type == aiohttp.WSMsgType.TEXT:
@@ -1512,7 +1679,9 @@ class QwenRealtimeTTSService(TTSService):
                     if event_type == "flush_done":
                         context = self._context
                         if context is None:
-                            raise RuntimeError("Realtime flush completed without an active utterance")
+                            raise RuntimeError(
+                                "Realtime flush completed without an active utterance"
+                            )
                         self._validate_event_context(context, event)
                         await self._finish_audio_context(context)
                         context.completed.set()
@@ -1523,12 +1692,13 @@ class QwenRealtimeTTSService(TTSService):
                         self._final_received.set()
                         return
                     if event_type == "error":
-                        raise RuntimeError(
-                            f"Realtime TTS server error: {event.get('error') or 'unknown'}"
-                        )
-                    raise RuntimeError(
-                        f"Unsupported realtime WebSocket response: {event_type!r}"
-                    )
+                        server_error = event.get("error") or "unknown"
+                        if server_error == "inactivity_timeout":
+                            raise aiohttp.ClientConnectionError(
+                                "Realtime TTS WebSocket inactivity timeout"
+                            )
+                        raise RuntimeError(f"Realtime TTS server error: {server_error}")
+                    raise RuntimeError(f"Unsupported realtime WebSocket response: {event_type!r}")
                 if message.type in {
                     aiohttp.WSMsgType.CLOSE,
                     aiohttp.WSMsgType.CLOSED,
@@ -1546,14 +1716,17 @@ class QwenRealtimeTTSService(TTSService):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - surfaced through the active turn
-            self._connection_error = exc
             context = self._context
             if context is not None:
                 context.error = exc
                 if context.attempt is not None:
                     context.attempt.error = f"{type(exc).__name__}: {exc}"
+                error_frame = self._error_frame(context)
+                if error_frame is not None:
+                    await self.push_error_frame(error_frame)
                 await self._finish_audio_context(context)
                 context.completed.set()
+            await self._discard_websocket(exc)
         finally:
             self._final_received.set()
 
@@ -1563,25 +1736,30 @@ class QwenRealtimeTTSService(TTSService):
             yield ErrorFrame(error="Realtime TTS utterance context is not active")
             return
         if context.error is not None:
-            yield ErrorFrame(
-                error=f"Realtime TTS request failed: {context.error}",
-                exception=context.error,
-            )
+            error_frame = self._error_frame(context)
+            if error_frame is not None:
+                yield error_frame
             return
 
         context.full_text += text
         if context.request is not None:
             context.request.text = context.full_text
         try:
-            if context.pending_text is not None:
-                await self._send_text(context, context.pending_text, flush=False)
-            context.pending_text = text
+            if self.defer_final_text_for_flush:
+                if context.pending_text is not None:
+                    await self._send_text(context, context.pending_text, flush=False)
+                context.pending_text = text
+            else:
+                await self._send_text(context, text, flush=False)
             yield None
         except Exception as exc:  # noqa: BLE001 - convert provider failures to pipeline errors
             context.error = exc
             if context.attempt is not None:
                 context.attempt.error = f"{type(exc).__name__}: {exc}"
-            yield ErrorFrame(error=f"Realtime TTS request failed: {exc}", exception=exc)
+            await self._discard_websocket(exc)
+            error_frame = self._error_frame(context)
+            if error_frame is not None:
+                yield error_frame
 
     async def flush_audio(self, context_id: str | None = None):
         context = self._context
@@ -1591,9 +1769,12 @@ class QwenRealtimeTTSService(TTSService):
         try:
             if context.error is not None:
                 raise context.error
-            if context.pending_text is not None:
+            if self.defer_final_text_for_flush and context.pending_text is not None:
                 await self._send_text(context, context.pending_text, flush=True)
                 context.pending_text = None
+            elif not self.defer_final_text_for_flush:
+                await self._send_text(context, "", flush=True)
+            await self._finalize_turn_request(context)
             await asyncio.wait_for(
                 context.completed.wait(),
                 timeout=self._config.tts_timeout_seconds,
@@ -1604,9 +1785,10 @@ class QwenRealtimeTTSService(TTSService):
             context.error = exc
             if context.attempt is not None:
                 context.attempt.error = f"{type(exc).__name__}: {exc}"
-            await self.push_error_frame(
-                ErrorFrame(error=f"Realtime TTS request failed: {exc}", exception=exc)
-            )
+            await self._discard_websocket(exc)
+            error_frame = self._error_frame(context)
+            if error_frame is not None:
+                await self.push_error_frame(error_frame)
         finally:
             await self._finish_audio_context(context)
             now = time.perf_counter()
@@ -1621,12 +1803,214 @@ class QwenRealtimeTTSService(TTSService):
             if self._context is context:
                 self._context = None
 
+    async def _finalize_turn_request(self, context: RealtimeTTSContext) -> None:
+        del context
+
     async def on_turn_context_completed(self):
         context = self._context
         await super().on_turn_context_completed()
         # An LLM response with no text creates no audio context and needs no flush.
         if self._context is context and context is not None:
             self._context = None
+
+
+class ElevenLabsWebsocketTTSService(QwenRealtimeTTSService):
+    """Uses one ElevenLabs multi-context WebSocket per simulated call."""
+
+    transport_name = "elevenlabs_websocket"
+    defer_final_text_for_flush = True
+
+    @staticmethod
+    def _realtime_websocket_url(
+        base_url: str,
+        *,
+        voice: str,
+        model: str | None,
+    ) -> str:
+        url = base_url.rstrip("/")
+        if url.startswith("https://"):
+            url = "wss://" + url.removeprefix("https://")
+        elif url.startswith("http://"):
+            url = "ws://" + url.removeprefix("http://")
+        elif not url.startswith(("ws://", "wss://")):
+            raise ValueError("ElevenLabs WebSocket URL must use http(s) or ws(s)")
+        query = {
+            "model_id": model or "eleven_flash_v2_5",
+            "output_format": "pcm_8000",
+            "inactivity_timeout": 180,
+        }
+        return (
+            f"{url}/v1/text-to-speech/{quote(voice, safe='')}/multi-stream-input?{urlencode(query)}"
+        )
+
+    async def _connect(self) -> None:
+        if self._session is None:
+            raise RuntimeError("TTS WebSocket session was not started")
+        if not self._config.tts_voice:
+            raise RuntimeError("ElevenLabs WebSocket TTS requires --tts-voice")
+        if not self._config.tts_bearer_token:
+            raise RuntimeError("ElevenLabs WebSocket TTS requires --tts-bearer-token")
+
+        started_at = time.perf_counter()
+        websocket = await self._session.ws_connect(
+            self._realtime_websocket_url(
+                self._config.tts_url,
+                voice=self._config.tts_voice,
+                model=self._config.tts_api_model,
+            ),
+            headers={"xi-api-key": self._config.tts_bearer_token},
+            autoping=True,
+        )
+        self._websocket = websocket
+        self._connection_started_at = started_at
+        self._connection_ready_at = time.perf_counter()
+        self._connection_ready_wall_ns = time.time_ns()
+        self._connection_id = uuid.uuid4().hex
+        self._requests_on_connection = 0
+        self._connection_error = None
+        self._connection_error_at = None
+        self._final_received.clear()
+        self._receiver_task = asyncio.create_task(self._receive_audio())
+
+    async def _close(self, *, graceful: bool) -> None:
+        websocket = self._websocket
+        receiver_task = self._receiver_task
+        self._context = None
+
+        if websocket is not None and not websocket.closed:
+            if graceful:
+                try:
+                    await websocket.send_json({"close_socket": True})
+                except Exception as exc:  # noqa: BLE001 - teardown still closes the socket
+                    logger.debug("ElevenLabs WebSocket graceful close failed: {}", exc)
+            self._final_received.set()
+            await websocket.close()
+        if receiver_task is not None and not receiver_task.done():
+            receiver_task.cancel()
+            await asyncio.gather(receiver_task, return_exceptions=True)
+        self._websocket = None
+        self._receiver_task = None
+
+        session = self._session
+        self._session = None
+        await _close_tracked_tts_session(session)
+
+    async def on_turn_context_created(self, context_id: str):
+        await super().on_turn_context_created(context_id)
+        websocket = self._websocket
+        if websocket is None or websocket.closed:
+            raise RuntimeError("ElevenLabs WebSocket is not connected")
+        await websocket.send_json({"context_id": context_id, "text": " "})
+
+    async def _send_text(
+        self,
+        context: RealtimeTTSContext,
+        text: str,
+        *,
+        flush: bool,
+    ) -> None:
+        websocket = self._websocket
+        if websocket is None or websocket.closed:
+            raise RuntimeError("ElevenLabs WebSocket is not connected")
+        request, attempt = self._ensure_request(context)
+        first_send = request.websocket_send_started_at is None
+        if first_send:
+            ModalTTSService._record_websocket_send_start(request, attempt)
+        await websocket.send_json(
+            {
+                "context_id": context.context_id,
+                "text": text,
+                "flush": flush,
+            }
+        )
+        if first_send:
+            ModalTTSService._record_websocket_send_complete(request, attempt)
+
+    async def _finalize_turn_request(self, context: RealtimeTTSContext) -> None:
+        websocket = self._websocket
+        if websocket is None or websocket.closed:
+            raise RuntimeError("ElevenLabs WebSocket is not connected")
+        await websocket.send_json({"context_id": context.context_id, "close_context": True})
+
+    async def _receive_audio(self) -> None:
+        try:
+            while True:
+                websocket = self._websocket
+                if websocket is None:
+                    return
+                message = await websocket.receive()
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    event = json.loads(message.data)
+                    context = self._context
+                    event_context_id = event.get("context_id")
+                    if context is not None and event_context_id is not None:
+                        self._validate_event_context(context, event)
+
+                    encoded_audio = event.get("audio")
+                    if encoded_audio:
+                        if context is None or context.request is None or context.attempt is None:
+                            raise RuntimeError(
+                                "ElevenLabs audio arrived without an active utterance"
+                            )
+                        chunk = base64.b64decode(encoded_audio, validate=True)
+                        if len(chunk) % 2:
+                            raise RuntimeError("ElevenLabs returned incomplete PCM16 audio")
+                        self._state.received_tts_body(
+                            context.request,
+                            context.attempt,
+                            len(chunk),
+                        )
+                        await self.stop_ttfb_metrics()
+                        await self.append_to_audio_context(
+                            context.context_id,
+                            TTSAudioRawFrame(
+                                chunk,
+                                sample_rate=8_000,
+                                num_channels=1,
+                                context_id=context.context_id,
+                            ),
+                        )
+
+                    is_final = event.get("is_final", event.get("isFinal"))
+                    if is_final is True:
+                        if context is None:
+                            raise RuntimeError(
+                                "ElevenLabs context completed without an active utterance"
+                            )
+                        await self._finish_audio_context(context)
+                        context.completed.set()
+                        continue
+                    if event.get("error") is not None or event.get("type") == "error":
+                        raise RuntimeError(
+                            f"ElevenLabs server error: "
+                            f"{event.get('error') or event.get('message') or 'unknown'}"
+                        )
+                    continue
+                if message.type in {
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                }:
+                    if self._final_received.is_set():
+                        return
+                    raise aiohttp.ClientConnectionError("ElevenLabs WebSocket closed before final")
+                if message.type == aiohttp.WSMsgType.ERROR:
+                    raise aiohttp.ClientConnectionError(
+                        f"ElevenLabs WebSocket error: {websocket.exception()}"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced through the active turn
+            self._connection_error = exc
+            context = self._context
+            if context is not None:
+                context.error = exc
+                if context.attempt is not None:
+                    context.attempt.error = f"{type(exc).__name__}: {exc}"
+                await self._finish_audio_context(context)
+                context.completed.set()
+        finally:
+            self._final_received.set()
 
 
 class RecordingMetricsProcessor(FrameProcessor):
@@ -1738,10 +2122,7 @@ def load_benchmark_config(path: Path) -> dict[str, Any]:
         if number < 0:
             raise ValueError(f"Benchmark threshold {name!r} cannot be negative")
         thresholds[name] = number
-    if (
-        "request_rate_achievement_pct_min" in thresholds
-        and intended_request_rate_rps is None
-    ):
+    if "request_rate_achievement_pct_min" in thresholds and intended_request_rate_rps is None:
         raise ValueError(
             "benchmark.intended_request_rate_rps is required for the request-rate threshold"
         )
@@ -1855,6 +2236,10 @@ def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
         )
         if receive_to_vllm_ms is None
         else receive_to_vllm_ms,
+        "first_text_receive_to_segment_enqueue_ms": _first_segment_metric(
+            attempt.realtime_segments,
+            "first_text_receive_to_segment_enqueue_ms",
+        ),
         "vllm_send_to_first_24khz_audio_ms": _first_segment_metric(
             attempt.realtime_segments,
             "vllm_send_to_first_24khz_audio_ms",
@@ -1878,6 +2263,18 @@ def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
         "segment_generation_ms": _segment_metric_values(
             attempt.realtime_segments,
             "generation_ms",
+        ),
+        "upstream_pcm_first_to_second_chunk_ms": _segment_metric_values(
+            attempt.realtime_segments,
+            "upstream_pcm_first_to_second_chunk_ms",
+        ),
+        "upstream_pcm_mean_chunk_gap_ms": _segment_metric_values(
+            attempt.realtime_segments,
+            "upstream_pcm_mean_chunk_gap_ms",
+        ),
+        "upstream_pcm_max_chunk_gap_ms": _segment_metric_values(
+            attempt.realtime_segments,
+            "upstream_pcm_max_chunk_gap_ms",
         ),
         "realtime_segments": attempt.realtime_segments,
         "error": attempt.error,
@@ -1943,6 +2340,26 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
         ),
         "body_chunk_count": request.body_chunk_count,
         "body_bytes": request.body_bytes,
+        "first_chunk_processing_ms": (
+            round(request.first_chunk_processing_seconds * 1000, 3)
+            if request.first_chunk_processing_seconds is not None
+            else None
+        ),
+        "max_chunk_processing_ms": (
+            round(request.max_chunk_processing_seconds * 1000, 3)
+            if request.first_chunk_processing_seconds is not None
+            else None
+        ),
+        "first_chunk_metrics_push_ms": (
+            round(request.first_chunk_metrics_push_seconds * 1000, 3)
+            if request.first_chunk_metrics_push_seconds is not None
+            else None
+        ),
+        "max_chunk_metrics_push_ms": (
+            round(request.max_chunk_metrics_push_seconds * 1000, 3)
+            if request.first_chunk_metrics_push_seconds is not None
+            else None
+        ),
         "websocket_send_ms": (
             _elapsed_ms(
                 request.websocket_send_started_at,
@@ -1965,6 +2382,10 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
         )
         if receive_to_vllm_ms is None
         else receive_to_vllm_ms,
+        "first_text_receive_to_segment_enqueue_ms": _first_segment_metric(
+            request.realtime_segments,
+            "first_text_receive_to_segment_enqueue_ms",
+        ),
         "vllm_send_to_first_24khz_audio_ms": _first_segment_metric(
             request.realtime_segments,
             "vllm_send_to_first_24khz_audio_ms",
@@ -2017,6 +2438,18 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
             request.realtime_segments,
             "generation_ms",
         ),
+        "upstream_pcm_first_to_second_chunk_ms": _segment_metric_values(
+            request.realtime_segments,
+            "upstream_pcm_first_to_second_chunk_ms",
+        ),
+        "upstream_pcm_mean_chunk_gap_ms": _segment_metric_values(
+            request.realtime_segments,
+            "upstream_pcm_mean_chunk_gap_ms",
+        ),
+        "upstream_pcm_max_chunk_gap_ms": _segment_metric_values(
+            request.realtime_segments,
+            "upstream_pcm_max_chunk_gap_ms",
+        ),
         "realtime_segments": request.realtime_segments,
         "attempts": [_tts_attempt_report(attempt) for attempt in request.attempts],
         "client_wall_time_ns": {
@@ -2048,9 +2481,9 @@ def _log_client_tts_timeline(request: TTSRequest) -> None:
     if request.timeline_logged:
         return
     request.timeline_logged = True
-    logger.info(
+    logger.opt(lazy=True).debug(
         "{}",
-        json.dumps(
+        lambda: json.dumps(
             {
                 "event": "tts_timeline",
                 "component": "pipecat_client",
@@ -2155,6 +2588,11 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
             for request in request_reports
             if request["websocket_receive_to_vllm_send_ms"] is not None
         ],
+        "first_text_receive_to_segment_enqueue_ms": [
+            request["first_text_receive_to_segment_enqueue_ms"]
+            for request in request_reports
+            if request["first_text_receive_to_segment_enqueue_ms"] is not None
+        ],
         "vllm_send_to_first_24khz_audio_ms": [
             request["vllm_send_to_first_24khz_audio_ms"]
             for request in request_reports
@@ -2189,6 +2627,21 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
         "segment_generation_ms": [
             value for request in request_reports for value in request["segment_generation_ms"]
         ],
+        "upstream_pcm_first_to_second_chunk_ms": [
+            value
+            for request in request_reports
+            for value in request["upstream_pcm_first_to_second_chunk_ms"]
+        ],
+        "upstream_pcm_mean_chunk_gap_ms": [
+            value
+            for request in request_reports
+            for value in request["upstream_pcm_mean_chunk_gap_ms"]
+        ],
+        "upstream_pcm_max_chunk_gap_ms": [
+            value
+            for request in request_reports
+            for value in request["upstream_pcm_max_chunk_gap_ms"]
+        ],
         "inter_audio_ms": _milliseconds(turn.inter_audio_seconds),
         "playback_gap_ms": _milliseconds(turn.playback_gap_seconds),
         "rtf": [request["rtf"] for request in request_reports if request["rtf"] is not None],
@@ -2197,6 +2650,30 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
         "failure_component": turn.failure_component,
         "error": turn.error,
     }
+
+
+def _create_llm_service(config: BotConfig, call_id: int):
+    common = {
+        "name": f"llm:{call_id}",
+        "api_key": config.llm_api_key,
+        "base_url": config.llm_base_url,
+    }
+    if config.llm_model.lower().startswith("gpt-6-luna"):
+        return OpenAIResponsesHttpLLMService(
+            **common,
+            settings=OpenAIResponsesHttpLLMService.Settings(
+                model=config.llm_model,
+                system_instruction=config.system_prompt,
+            ),
+        )
+    return OpenAILLMService(
+        **common,
+        settings=OpenAILLMService.Settings(
+            model=config.llm_model,
+            temperature=0.0,
+            system_instruction=config.system_prompt,
+        ),
+    )
 
 
 async def run_call(
@@ -2208,21 +2685,13 @@ async def run_call(
     output_dir: Path,
 ) -> dict[str, Any]:
     state = CallState(sample_rate=config.sample_rate, bot_number=call_id)
-    llm = OpenAILLMService(
-        name=f"llm:{call_id}",
-        api_key=config.llm_api_key,
-        base_url=config.llm_base_url,
-        settings=OpenAILLMService.Settings(
-            model=config.llm_model,
-            temperature=0.0,
-            system_instruction=config.system_prompt,
-        ),
-    )
-    tts = (
-        QwenRealtimeTTSService(config, state)
-        if config.tts_transport == "realtime_websocket"
-        else ModalTTSService(config, state)
-    )
+    llm = _create_llm_service(config, call_id)
+    if config.tts_transport == "realtime_websocket":
+        tts = QwenRealtimeTTSService(config, state)
+    elif config.tts_transport == "elevenlabs_websocket":
+        tts = ElevenLabsWebsocketTTSService(config, state)
+    else:
+        tts = ModalTTSService(config, state)
     recorder = RecordingMetricsProcessor(state, llm_name=llm.name, tts_name=tts.name)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(LLMContext())
 
@@ -2244,6 +2713,14 @@ async def run_call(
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(_, frame: ErrorFrame):
         state.errors.append(frame.error)
+        turn = state.current_turn
+        if turn is not None and isinstance(tts, QwenRealtimeTTSService):
+            connection_error = tts.connection_error
+            if connection_error is not None and frame.exception is connection_error:
+                turn.failure_component = (
+                    "transport" if tts._is_transport_error(connection_error) else "tts"
+                )
+                turn.error = frame.error
 
     state.started_at = time.perf_counter()
     deadline = state.started_at + duration_seconds
@@ -2266,7 +2743,16 @@ async def run_call(
             except TimeoutError:
                 error = f"Turn {turn.number} timed out"
                 turn.error = error
-                if not turn.tts_requests:
+                if (
+                    isinstance(tts, QwenRealtimeTTSService)
+                    and tts.connection_error is not None
+                    and tts.connection_error_at is not None
+                    and tts.connection_error_at >= turn.started_at
+                ):
+                    turn.failure_component = (
+                        "transport" if tts._is_transport_error(tts.connection_error) else "tts"
+                    )
+                elif not turn.tts_requests:
                     turn.failure_component = "llm"
                 elif turn.first_playable_at is None:
                     turn.failure_component = "tts"
@@ -2318,6 +2804,9 @@ async def run_call(
         "tts_retry_count": sum(max(0, len(request.attempts) - 1) for request in tts_requests),
         "failed_tts_attempt_count": failed_tts_attempts,
         "llm_failure_count": sum(turn.failure_component == "llm" for turn in state.turns),
+        "transport_failure_count": sum(
+            turn.failure_component == "transport" for turn in state.turns
+        ),
         "tts_failure_count": failed_tts_requests,
         "success": bool(turns) and not state.errors and failed_tts_requests == 0,
         "end_to_end_ttfa_ms": [
@@ -2332,13 +2821,9 @@ async def run_call(
         "tts_ttfa_ms": [value for turn in turns for value in turn["tts_ttfa_ms"]],
         "playable_gate_ms": [value for turn in turns for value in turn["playable_gate_ms"]],
         "tts_request_ms": [value for turn in turns for value in turn["tts_request_ms"]],
-        "websocket_send_ms": [
-            value for turn in turns for value in turn["websocket_send_ms"]
-        ],
+        "websocket_send_ms": [value for turn in turns for value in turn["websocket_send_ms"]],
         "client_send_to_websocket_receive_ms": [
-            value
-            for turn in turns
-            for value in turn["client_send_to_websocket_receive_ms"]
+            value for turn in turns for value in turn["client_send_to_websocket_receive_ms"]
         ],
         "client_send_complete_to_websocket_receive_ms": [
             value
@@ -2346,17 +2831,16 @@ async def run_call(
             for value in turn["client_send_complete_to_websocket_receive_ms"]
         ],
         "websocket_receive_to_vllm_send_ms": [
-            value
-            for turn in turns
-            for value in turn["websocket_receive_to_vllm_send_ms"]
+            value for turn in turns for value in turn["websocket_receive_to_vllm_send_ms"]
+        ],
+        "first_text_receive_to_segment_enqueue_ms": [
+            value for turn in turns for value in turn["first_text_receive_to_segment_enqueue_ms"]
         ],
         "vllm_send_to_first_24khz_audio_ms": [
             value for turn in turns for value in turn["vllm_send_to_first_24khz_audio_ms"]
         ],
         "first_24khz_audio_to_first_8khz_pcm_sent_ms": [
-            value
-            for turn in turns
-            for value in turn["first_24khz_audio_to_first_8khz_pcm_sent_ms"]
+            value for turn in turns for value in turn["first_24khz_audio_to_first_8khz_pcm_sent_ms"]
         ],
         "vllm_send_to_first_pcm_ms": [
             value for turn in turns for value in turn["vllm_send_to_first_pcm_ms"]
@@ -2365,9 +2849,7 @@ async def run_call(
             value for turn in turns for value in turn["client_send_to_first_pcm_ms"]
         ],
         "websocket_connection_age_at_send_ms": [
-            value
-            for turn in turns
-            for value in turn["websocket_connection_age_at_send_ms"]
+            value for turn in turns for value in turn["websocket_connection_age_at_send_ms"]
         ],
         "segment_queue_ms": [value for turn in turns for value in turn["segment_queue_ms"]],
         "segment_first_audio_ms": [
@@ -2375,6 +2857,15 @@ async def run_call(
         ],
         "segment_generation_ms": [
             value for turn in turns for value in turn["segment_generation_ms"]
+        ],
+        "upstream_pcm_first_to_second_chunk_ms": [
+            value for turn in turns for value in turn["upstream_pcm_first_to_second_chunk_ms"]
+        ],
+        "upstream_pcm_mean_chunk_gap_ms": [
+            value for turn in turns for value in turn["upstream_pcm_mean_chunk_gap_ms"]
+        ],
+        "upstream_pcm_max_chunk_gap_ms": [
+            value for turn in turns for value in turn["upstream_pcm_max_chunk_gap_ms"]
         ],
         "inter_audio_ms": [value for turn in turns for value in turn["inter_audio_ms"]],
         "playback_gap_ms": [value for turn in turns for value in turn["playback_gap_ms"]],
@@ -2454,12 +2945,7 @@ def _percentage(numerator: float, denominator: float) -> float | None:
 
 
 def _request_reports(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        request
-        for call in calls
-        for turn in call["turns"]
-        for request in turn["tts_requests"]
-    ]
+    return [request for call in calls for turn in call["turns"] for request in turn["tts_requests"]]
 
 
 def _request_population(requests: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2543,9 +3029,7 @@ def _runtime_report(observations: dict[str, Any] | None) -> dict[str, Any] | Non
         and "error" not in tcp_start
         and "error" not in tcp_end
     ):
-        tcp_cleanup_passed = tcp_end.get("ESTABLISHED", 0) <= tcp_start.get(
-            "ESTABLISHED", 0
-        )
+        tcp_cleanup_passed = tcp_end.get("ESTABLISHED", 0) <= tcp_start.get("ESTABLISHED", 0)
     rss_slope_mb_per_hour = None
     if len(rss_samples) >= 2:
         elapsed_values = [sample["elapsed_seconds"] for sample in rss_samples]
@@ -2589,7 +3073,9 @@ def _threshold_report(
     for name, threshold in configured.items():
         value = observed.get(name)
         comparator = ">=" if name.endswith("_min") else "<="
-        passed = value is not None and (value >= threshold if comparator == ">=" else value <= threshold)
+        passed = value is not None and (
+            value >= threshold if comparator == ">=" else value <= threshold
+        )
         checks[name] = {
             "observed": value,
             "threshold": threshold,
@@ -2634,6 +3120,7 @@ def build_load_report(
         "client_send_to_websocket_receive_ms",
         "client_send_complete_to_websocket_receive_ms",
         "websocket_receive_to_vllm_send_ms",
+        "first_text_receive_to_segment_enqueue_ms",
         "vllm_send_to_first_24khz_audio_ms",
         "first_24khz_audio_to_first_8khz_pcm_sent_ms",
         "vllm_send_to_first_pcm_ms",
@@ -2642,6 +3129,9 @@ def build_load_report(
         "segment_queue_ms",
         "segment_first_audio_ms",
         "segment_generation_ms",
+        "upstream_pcm_first_to_second_chunk_ms",
+        "upstream_pcm_mean_chunk_gap_ms",
+        "upstream_pcm_max_chunk_gap_ms",
         "tts_processing_ms",
         "inter_audio_ms",
         "playback_gap_ms",
@@ -2665,7 +3155,14 @@ def build_load_report(
     total_call_sessions = len(calls) + harness_error_count
     total_tts_requests = sum(call["tts_request_count"] for call in calls)
     playback_gaps = _flatten(calls, "playback_gap_ms")
-    positive_playback_gaps = sum(gap > 0 for gap in playback_gaps)
+    turns = [turn for call in calls for turn in call["turns"]]
+    material_playback_gaps = [
+        gap for gap in playback_gaps if gap > PLAYBACK_GAP_REPORT_THRESHOLD_MS
+    ]
+    turns_with_playback_gaps = sum(
+        any(gap > PLAYBACK_GAP_REPORT_THRESHOLD_MS for gap in turn["playback_gap_ms"])
+        for turn in turns
+    )
     achieved_request_rate_rps = (
         total_tts_requests / phase_wall_seconds if phase_wall_seconds > 0 else None
     )
@@ -2690,7 +3187,7 @@ def build_load_report(
             sum(call["failed_tts_request_count"] for call in calls),
             total_tts_requests,
         ),
-        "playback_gap_rate_pct": _percentage(positive_playback_gaps, len(playback_gaps)),
+        "playback_gap_rate_pct": _percentage(turns_with_playback_gaps, len(turns)),
         "transport_stall_rate_pct": _percentage(transport_stalls, total_tts_requests),
     }
     threshold_observed = {
@@ -2764,11 +3261,24 @@ def build_load_report(
             "llm_failures": sum(call.get("llm_failure_count", 0) for call in calls),
             "final_tts_failures": sum(call["failed_tts_request_count"] for call in calls),
             "recovered_tts_retries": recovered_retries,
+            "transport_failures": sum(call.get("transport_failure_count", 0) for call in calls),
             "transport_stalls": transport_stalls,
             "failed_calls": failed_calls,
             "harness_failures": harness_error_count,
         },
         "rates": rates,
+        "playback_gaps": {
+            "report_threshold_ms": PLAYBACK_GAP_REPORT_THRESHOLD_MS,
+            "raw_positive_event_count": sum(gap > 0 for gap in playback_gaps),
+            "events_over_threshold": len(material_playback_gaps),
+            "affected_turns": turns_with_playback_gaps,
+            "total_turns": len(turns),
+            "affected_turn_rate_pct": rates["playback_gap_rate_pct"],
+            "duration_over_threshold_ms": _distribution(material_playback_gaps),
+            "events_over_100_ms": sum(gap > 100 for gap in playback_gaps),
+            "events_over_500_ms": sum(gap > 500 for gap in playback_gaps),
+            "events_over_1000_ms": sum(gap > 1_000 for gap in playback_gaps),
+        },
         "rtf": {
             "weighted": round(weighted_rtf, 6) if weighted_rtf is not None else None,
             "distribution": distributions["rtf"],
@@ -2809,8 +3319,9 @@ def build_load_report(
             "Inter-audio is the wall-clock interval between consecutive received PCM frames."
         ),
         "playback_gap_note": (
-            "Playback gap is underrun time: zero while buffered audio remains, positive when "
-            "the next PCM frame arrives after playback would have emptied the buffer."
+            "Playback gap is a zero-buffer simulated underrun after the first audible frame, "
+            "not measured speaker output. Raw durations include tiny scheduling jitter; "
+            "playback_gap_rate_pct is the percentage of turns with a gap over 20 ms."
         ),
         "tts_timeline_note": (
             "response_headers_ms is HTTP response headers, first_body_ms is the first arbitrary "
@@ -2835,11 +3346,11 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tts-url", default=os.getenv("TTS_URL"))
     parser.add_argument(
         "--tts-transport",
-        choices=("http", "websocket", "realtime_websocket"),
+        choices=("http", "websocket", "realtime_websocket", "elevenlabs_websocket"),
         default=os.getenv("TTS_TRANSPORT", "http"),
         help=(
             "Use one POST per turn, one persistent ASGI WebSocket per call, or "
-            "Qwen's token-streaming realtime WebSocket"
+            "Qwen's realtime WebSocket, or ElevenLabs' multi-context WebSocket"
         ),
     )
     parser.add_argument(
@@ -2871,7 +3382,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--system-prompt",
         default="Follow the user's wording exactly. Do not add commentary.",
     )
-    parser.add_argument("--llm-model", default=os.getenv("LLM_MODEL", "gpt-4.1-mini"))
+    parser.add_argument("--llm-model", default=os.getenv("LLM_MODEL", "gpt-6-luna"))
     parser.add_argument("--llm-api-key", default=os.getenv("OPENAI_API_KEY"))
     parser.add_argument("--llm-base-url", default=os.getenv("LLM_BASE_URL"))
     parser.add_argument(
@@ -2896,13 +3407,11 @@ def validate_common_arguments(parser: argparse.ArgumentParser, args: argparse.Na
         parser.error("--tts-url or TTS_URL is required")
     if not args.llm_api_key:
         parser.error("--llm-api-key or OPENAI_API_KEY is required")
-    if args.tts_transport == "realtime_websocket" and not args.tts_voice:
-        parser.error("--tts-voice or TTS_VOICE is required for realtime_websocket")
-    if args.tts_transport == "realtime_websocket" and not args.tts_bearer_token:
-        parser.error(
-            "--tts-bearer-token, TTS_BEARER_TOKEN, or TTS_API_KEY is required "
-            "for realtime_websocket"
-        )
+    realtime_transports = {"realtime_websocket", "elevenlabs_websocket"}
+    if args.tts_transport in realtime_transports and not args.tts_voice:
+        parser.error(f"--tts-voice is required for {args.tts_transport}")
+    if args.tts_transport in realtime_transports and not args.tts_bearer_token:
+        parser.error(f"--tts-bearer-token is required for {args.tts_transport}")
     if args.sample_rate < 1 or args.tts_source_sample_rate < 1:
         parser.error("sample rates must be positive")
     if args.tts_timeout_seconds <= 0 or args.turn_timeout_seconds <= 0:

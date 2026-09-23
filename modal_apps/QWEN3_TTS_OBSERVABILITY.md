@@ -232,18 +232,88 @@ every record and promotes the first segment into the request latency summary.
 
 | Field | Unit/meaning |
 |---|---|
-| `websocket_receive_to_vllm_send_ms` | Server-monotonic time from receipt of the control message that released the segment through local vLLM submission; includes segment queueing |
+| `trigger_reason` | Why the segment was released: `punctuation`, `first_segment_fallback`, `first_segment_deadline`, `hard_max`, or `flush` |
+| `text_characters` | Number of characters submitted in this Qwen segment |
+| `first_text_receive_to_segment_enqueue_ms` | Server-monotonic time from the first buffered text for the segment through its release into the synthesis queue |
+| `websocket_receive_to_vllm_send_ms` | Server-monotonic time from the last contributing message through local vLLM submission; includes remaining deadline wait and segment queueing |
+| `segment_enqueue_to_vllm_send_ms` | Server-monotonic time from segment enqueue through local vLLM submission; retained in each `realtime_segments` record |
 | `vllm_send_to_first_24khz_audio_ms` | Local vLLM submission through receipt of its first native 24 kHz PCM chunk |
 | `first_24khz_audio_to_first_8khz_pcm_sent_ms` | First native chunk through resampling and completion of the first public 8 kHz WebSocket send |
 | `client_send_to_first_pcm_ms` | Client-monotonic send start through receipt of the first public PCM frame |
 | `queue_ms` | Segment enqueue through start of segment synthesis |
 | `first_audio_ms` | Segment synthesis start through the first resampled chunk becoming available to send |
 | `generation_ms` | Segment synthesis start through the completed upstream stream |
+| `upstream_pcm_first_to_second_chunk_ms` | Gap between the first two native 24 kHz HTTP PCM chunks; this is transport-visible packet cadence, not Stage 0 codec-token ITL |
+| `upstream_pcm_mean_chunk_gap_ms` | Mean gap between native 24 kHz HTTP PCM chunks for the segment |
+| `upstream_pcm_max_chunk_gap_ms` | Maximum gap between native 24 kHz HTTP PCM chunks for the segment |
 
 The event also carries server wall-clock timestamps for receipt, vLLM
 submission, first 24 kHz audio, and first 8 kHz send. Use the monotonic duration
 fields for server-internal analysis; client/server wall-clock subtraction
 depends on clock synchronization.
+
+The realtime segmenter releases the first complete clause or sentence after 20
+characters. If no punctuation arrives, only the first segment uses a safe word
+boundary at approximately 48 characters. Later unpunctuated segments use a
+safe boundary near the 100-character hard target. End-of-turn flushes the
+remainder immediately. Decimal numbers, thousands separators, common
+abbreviations, initials, and individual words are not split.
+
+The first segment also has a 100 ms deadline starting with its first text
+message. The receiver wakes at the deadline even if no further message arrives.
+It emits the latest whitespace-delimited prefix of at least 20 characters and
+retains an unfinished trailing word. With insufficient complete text, it waits
+for more input and checks again on arrival. The timer applies once per context,
+resets after flush, and does not reset the connection inactivity timeout.
+
+The realtime route omits `segment_started` by default; PCM is its first segment
+output. `segment_done`, `flush_done`, and their ordering remain intact. Two
+independent query parameters enable controlled comparisons on the same deployment:
+
+| Variant | `emit_segment_started` | `first_segment_max_wait_ms` |
+|---|---|---|
+| Previous behavior | `true` | `0` |
+| Omit start event only | `false` | `0` |
+| Deadline only | `true` | `100` |
+| Both (default) | `false` | `100` |
+
+Pass these on the base `--tts-url` used by `bot.py` or `load_test.py`, for example
+`--tts-url 'https://ENDPOINT.modal.run?emit_segment_started=false&first_segment_max_wait_ms=0'`.
+The URL is retained in the run summary; accepted settings appear in the server
+connection log and `ready` event. Deadline bounds are 0–1000 ms; 0 disables it.
+These local changes require deployment before a live latency comparison.
+
+The local Qwen realtime client also sends an application-level `{"type":"ping"}`
+after 10 seconds without an outgoing text, flush, or ping message. Incoming audio
+does not postpone it: the server's inactivity timer measures incoming application
+messages, not outgoing audio or WebSocket protocol heartbeats. When a shorter
+`inactivity_timeout` is supplied, the ping interval is one third of that timeout,
+capped at 10 seconds. The task stops on server final/error, teardown, or reconnect;
+ElevenLabs and the other transports are unchanged. This prevents healthy idle
+connections expiring; it does not change audio, repair an empty LLM response, or
+guarantee survival through network loss or an event-loop stall.
+
+For additive timing analysis, use first text → enqueue, enqueue → vLLM,
+vLLM → first native PCM, and native PCM → public PCM. Do not add
+`websocket_receive_to_vllm_send_ms` to text accumulation for deadline-triggered
+segments: those intervals overlap. Removing the start event is an experiment;
+its effect on Modal delivery batching has not yet been measured.
+
+Stage 0 codec-token cadence remains available in the stage histogram fields as
+`inter_token_latency_seconds` and `request_time_per_output_token_seconds`.
+These are kept separate from the HTTP PCM chunk-gap fields above.
+
+The realtime ASGI deployment uses a `4, 4, 8, 16, 25` codec-frame ramp before
+settling at the standard 25-frame steady-state cadence, with the pinned
+72-frame Code2Wav left context unchanged. The deploy config owns this schedule;
+the request payload does not override the initial chunk size. The active values
+are included in the `vllm_stage_utilization_config` startup record so a run can
+be tied to its exact packet schedule.
+
+The realtime ASGI/AP-south function overrides Stage 0
+`max_num_batched_tokens` to `8192` for the next latency A/B. Stage 1 retains
+the bundled `65536` budget required for its flattened codec prefill. This is a
+local configuration change until that function is explicitly redeployed.
 
 ### Modal Server comparison target
 
@@ -275,6 +345,34 @@ Graph capture messages prove that a graph exists. Hit/fallback statistics are
 needed to prove that production requests replay it. The Stage 1 shape values
 are codec-frame execution shapes, not concurrency, text-token lengths, PCM
 sample counts, or `max_num_seqs` usage.
+
+### Realtime Stage 0/Stage 1 batching diagnostic
+
+Run `uv run python monitor_qwen_runtime.py --app tts-l40s-qwen3-tts-realtime`
+alongside a soak. This local monitor reads existing Modal logs; it does not
+change inference or require a redeploy. The realtime deployment enables
+`Code2Wav batch stats` every 100 Stage 1 forwards.
+
+| Monitor field | Meaning |
+|---|---|
+| `stages["0"].running`, `waiting`, `max_num_seqs`, `kv_pct`, `preemptions_total` | Stage 0 capacity and queue pressure at the latest one-second sample |
+| `stages["0"].queue_p95_upper_bound_s`, `prefill_mean_s`, `decode_mean_s`, `inter_token_mean_s`, `iteration_tokens_mean`, `iteration_tokens_p95_upper_bound` | Container-lifetime vLLM histogram summaries; not run-window percentiles or exact token-budget hits |
+| `stage_overrides` | Effective stage overrides, including Stage 0 `max_num_batched_tokens`, only if the monitor sees the startup record |
+| `stage1_decoder_batch_since_first_sample.decode_items_per_forward` | Valid codec-chunk decode items reaching each Stage 1 model forward during the observed window |
+| `stage1_decoder_batch_since_first_sample.decode_items_per_group` | Items per actual Code2Wav decoder call after frame-length grouping |
+| `stage1_decoder_batch_since_first_sample.groups_per_forward`, `padding_pct` | Decoder calls per forward and right-padding overhead |
+| `stage1_pre_scheduler_ready_queue_observed` | Always `false`: the current pinned runtime does not export this queue depth |
+
+The Stage 1 window is calculated by subtracting cumulative counters from the
+first batch-stat sample seen on the same container. It excludes work before
+that first sample, which can be up to 100 forwards; a container reset starts a
+new baseline. `requests` in the upstream batch-stat line counts codec decode
+items, **not** HTTP requests or WebSocket turns. Low items per forward and per
+group show that little work reached the model together. High items per forward
+but low items per group point to frame-shape fragmentation. Neither pattern by
+itself distinguishes staggered Stage 0 arrivals from Stage 1 scheduler delay:
+that needs a new chunk-ready queue-depth/age measurement inside the pinned
+vLLM-Omni transfer/scheduler path.
 
 ## Error events
 

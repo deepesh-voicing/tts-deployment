@@ -1,15 +1,16 @@
 import asyncio
+import base64
 import json
 import threading
 import time
 import wave
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from aiohttp import web
-from pipecat.frames.frames import TTSAudioRawFrame
+from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame
 
 import bot as bot_module
 import load_test as load_test_module
@@ -25,7 +26,7 @@ from bot import (
     run_call,
     tts_session_counters,
 )
-from load_test import _call_start_delay, _mixed_scenario, async_main
+from load_test import _apply_wav_retention, _call_start_delay, _mixed_scenario, async_main
 
 SAMPLE_RATE = 8_000
 FIRST_CHUNK_SAMPLES = 304
@@ -42,6 +43,69 @@ def _call_state() -> CallState:
     state.turns.append(turn)
     state.current_turn = turn
     return state
+
+
+def test_luna_uses_responses_api_without_temperature_override():
+    config = SimpleNamespace(
+        llm_model="gpt-5.6-luna",
+        llm_api_key="test-key",
+        llm_base_url=None,
+        system_prompt="Be exact.",
+    )
+
+    with (
+        patch("bot.OpenAIResponsesHttpLLMService") as responses_service,
+        patch("bot.OpenAILLMService") as chat_service,
+    ):
+        responses_service.Settings.return_value = "responses-settings"
+        expected = responses_service.return_value
+
+        result = bot_module._create_llm_service(config, call_id=7)
+
+    assert result is expected
+    responses_service.Settings.assert_called_once_with(
+        model="gpt-5.6-luna",
+        system_instruction="Be exact.",
+    )
+    responses_service.assert_called_once_with(
+        name="llm:7",
+        api_key="test-key",
+        base_url=None,
+        settings="responses-settings",
+    )
+    chat_service.assert_not_called()
+
+
+def test_non_luna_model_keeps_chat_completions_path():
+    config = SimpleNamespace(
+        llm_model="gpt-4.1-mini",
+        llm_api_key="test-key",
+        llm_base_url="https://example.test/v1",
+        system_prompt="Be exact.",
+    )
+
+    with (
+        patch("bot.OpenAIResponsesHttpLLMService") as responses_service,
+        patch("bot.OpenAILLMService") as chat_service,
+    ):
+        chat_service.Settings.return_value = "chat-settings"
+        expected = chat_service.return_value
+
+        result = bot_module._create_llm_service(config, call_id=2)
+
+    assert result is expected
+    chat_service.Settings.assert_called_once_with(
+        model="gpt-4.1-mini",
+        temperature=0.0,
+        system_instruction="Be exact.",
+    )
+    chat_service.assert_called_once_with(
+        name="llm:2",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        settings="chat-settings",
+    )
+    responses_service.assert_not_called()
 
 
 def test_silent_priming_pause_is_not_a_playback_gap():
@@ -77,6 +141,9 @@ async def _run_local_pipeline(
     first_tts_header_delay_seconds: float = 0.0,
     tts_transport: str = "http",
     duration_seconds: float = 0.01,
+    wait_after_seconds: float = 0.0,
+    realtime_idle_timeout_seconds: float | None = None,
+    realtime_events: list[dict] | None = None,
 ):
     tts_post_count = 0
 
@@ -239,13 +306,15 @@ async def _run_local_pipeline(
         assert request.match_info["voice_id"] == "Vivian"
         assert request.query == {
             "output_format": "pcm_8000",
-            "inactivity_timeout": "30",
+            "inactivity_timeout": "180",
             "language": "English",
         }
         assert request.headers["Authorization"] == "Bearer test-token"
 
         websocket = web.WebSocketResponse()
         await websocket.prepare(request)
+        if realtime_events is not None:
+            realtime_events.append({"type": "connected"})
         await websocket.send_json(
             {
                 "type": "ready",
@@ -256,9 +325,22 @@ async def _run_local_pipeline(
             }
         )
         text_events = []
-        async for message in websocket:
+        while not websocket.closed:
+            try:
+                message = await asyncio.wait_for(
+                    websocket.receive(), timeout=realtime_idle_timeout_seconds
+                )
+            except TimeoutError:
+                await websocket.send_json({"type": "error", "error": "inactivity_timeout"})
+                await websocket.close()
+                break
             assert message.type == web.WSMsgType.TEXT
             event = json.loads(message.data)
+            if realtime_events is not None:
+                realtime_events.append(event)
+            if event["type"] == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
             if event["type"] == "text":
                 text_events.append(event)
                 if event["flush"]:
@@ -266,8 +348,13 @@ async def _run_local_pipeline(
                     assert [item["text"] for item in text_events] == [
                         "Hello from the test. ",
                         "This is sentence two.",
+                        "",
                     ]
-                    assert [item["flush"] for item in text_events] == [False, True]
+                    assert [item["flush"] for item in text_events] == [
+                        False,
+                        False,
+                        True,
+                    ]
                     assert {item["context_id"] for item in text_events} == {context_id}
                     websocket_receive_wall_ns = time.time_ns()
                     vllm_request_sent_wall_ns = time.time_ns()
@@ -290,24 +377,29 @@ async def _run_local_pipeline(
                             "type": "segment_done",
                             "segment_id": 1,
                             "context_id": context_id,
+                            "trigger_reason": "punctuation",
                             "text_characters": 48,
                             "output_bytes": 14_400,
                             "output_chunks": 3,
                             "websocket_receive_wall_ns": websocket_receive_wall_ns,
+                            "first_text_receive_wall_ns": websocket_receive_wall_ns,
                             "vllm_request_sent_wall_ns": vllm_request_sent_wall_ns,
                             "first_24khz_audio_wall_ns": first_24khz_audio_wall_ns,
                             "first_8khz_pcm_sent_wall_ns": first_8khz_pcm_sent_wall_ns,
                             "websocket_receive_to_vllm_send_ms": 1.25,
+                            "first_text_receive_to_segment_enqueue_ms": 5.0,
+                            "segment_enqueue_to_vllm_send_ms": 1.0,
                             "vllm_send_to_first_24khz_audio_ms": 2.5,
                             "first_24khz_audio_to_first_8khz_pcm_sent_ms": 0.75,
                             "queue_ms": 0.5,
                             "first_audio_ms": 3.25,
                             "generation_ms": 20.0,
+                            "upstream_pcm_first_to_second_chunk_ms": 4.0,
+                            "upstream_pcm_mean_chunk_gap_ms": 5.0,
+                            "upstream_pcm_max_chunk_gap_ms": 6.0,
                         }
                     )
-                    await websocket.send_json(
-                        {"type": "flush_done", "context_id": context_id}
-                    )
+                    await websocket.send_json({"type": "flush_done", "context_id": context_id})
                     text_events = []
                 continue
             assert event == {"type": "close"}
@@ -318,6 +410,61 @@ async def _run_local_pipeline(
             break
         return websocket
 
+    async def elevenlabs_websocket_handler(request):
+        assert request.match_info["voice_id"] == "Vivian"
+        assert request.query == {
+            "model_id": "eleven_flash_v2_5",
+            "output_format": "pcm_8000",
+            "inactivity_timeout": "180",
+        }
+        assert request.headers["xi-api-key"] == "test-token"
+
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        context_events = []
+        async for message in websocket:
+            assert message.type == web.WSMsgType.TEXT
+            event = json.loads(message.data)
+            if event == {"close_socket": True}:
+                await websocket.close()
+                break
+
+            context_events.append(event)
+            if event.get("close_context") is not True:
+                continue
+
+            context_id = event["context_id"]
+            assert context_events == [
+                {"context_id": context_id, "text": " "},
+                {
+                    "context_id": context_id,
+                    "text": "Hello from the test. ",
+                    "flush": False,
+                },
+                {
+                    "context_id": context_id,
+                    "text": "This is sentence two.",
+                    "flush": True,
+                },
+                {"context_id": context_id, "close_context": True},
+            ]
+            for chunk in (
+                b"\x00\x00" * 2400,
+                b"\xe8\x03" * 2400,
+                b"\xe8\x03" * 2400,
+            ):
+                await websocket.send_json(
+                    {
+                        "audio": base64.b64encode(chunk).decode("ascii"),
+                        "context_id": context_id,
+                        "isFinal": False,
+                    }
+                )
+                await asyncio.sleep(0.01)
+            await websocket.send_json({"context_id": context_id, "isFinal": True})
+            context_events = []
+        return websocket
+
     app = web.Application()
     app.router.add_post("/v1/chat/completions", chat_handler)
     app.router.add_post("/tts", tts_handler)
@@ -325,6 +472,10 @@ async def _run_local_pipeline(
     app.router.add_get(
         "/tts/v1/text-to-speech/{voice_id}/stream-input",
         tts_realtime_websocket_handler,
+    )
+    app.router.add_get(
+        "/tts/v1/text-to-speech/{voice_id}/multi-stream-input",
+        elevenlabs_websocket_handler,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -349,12 +500,16 @@ async def _run_local_pipeline(
         modal_usd_per_second=0.001,
         tts_voice="Vivian",
         tts_language="English",
-        tts_api_model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        tts_api_model=(
+            "eleven_flash_v2_5"
+            if tts_transport == "elevenlabs_websocket"
+            else "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+        ),
         tts_transport=tts_transport,
     )
     scenario = Scenario(
         name="test",
-        turns=(ScenarioTurn(prompt="Say the test line.", wait_after_seconds=0),),
+        turns=(ScenarioTurn(prompt="Say the test line.", wait_after_seconds=wait_after_seconds),),
     )
     try:
         results = await asyncio.gather(
@@ -469,6 +624,7 @@ def test_timed_call_records_audio_and_metrics_without_turn_wavs(tmp_path, monkey
     assert report["request_populations"]["no_retry"]["count"] == 1
     assert report["failure_breakdown"]["llm_failures"] == 0
     assert report["failure_breakdown"]["final_tts_failures"] == 0
+    assert report["failure_breakdown"]["transport_failures"] == 0
     assert report["failure_breakdown"]["transport_stalls"] == 0
     assert report["rtf"]["weighted"] is not None
     assert report["tail_breaches"]["first_playable_ttfa_ms"]["over_1000_ms"]["count"] >= 0
@@ -490,10 +646,39 @@ def test_two_calls_run_concurrently(tmp_path):
     assert counters_after["sessions_active"] == counters_before["sessions_active"]
 
 
-def test_websocket_transport_records_four_phase_timeline(tmp_path):
-    _, results = asyncio.run(
-        _run_local_pipeline(tmp_path, tts_transport="websocket")
+def test_playback_gap_report_filters_jitter_and_counts_affected_turns(tmp_path):
+    config, results = asyncio.run(_run_local_pipeline(tmp_path))
+    call = results[0]
+    call["turns"][0]["playback_gap_ms"] = [0.0, 0.01, 20.0]
+    call["turns"].append(
+        {"playback_gap_ms": [21.0, 120.0, 600.0, 1_200.0], "tts_requests": []}
     )
+    call["turn_count"] = 2
+    call["playback_gap_ms"] = [0.0, 0.01, 20.0, 21.0, 120.0, 600.0, 1_200.0]
+
+    report = build_load_report(
+        config,
+        results,
+        concurrency=1,
+        duration_seconds=1,
+        phase_wall_seconds=1,
+        modal_average_containers=1,
+        thresholds={"playback_gap_rate_pct_max": 1},
+    )
+
+    assert report["rates"]["playback_gap_rate_pct"] == 50.0
+    assert report["playback_gaps"]["raw_positive_event_count"] == 6
+    assert report["playback_gaps"]["events_over_threshold"] == 4
+    assert report["playback_gaps"]["affected_turns"] == 1
+    assert report["playback_gaps"]["affected_turn_rate_pct"] == 50.0
+    assert report["playback_gaps"]["events_over_100_ms"] == 3
+    assert report["playback_gaps"]["events_over_500_ms"] == 2
+    assert report["playback_gaps"]["events_over_1000_ms"] == 1
+    assert report["thresholds"]["checks"]["playback_gap_rate_pct_max"]["passed"] is False
+
+
+def test_websocket_transport_records_four_phase_timeline(tmp_path):
+    _, results = asyncio.run(_run_local_pipeline(tmp_path, tts_transport="websocket"))
 
     result = results[0]
     timeline = result["turns"][0]["tts_requests"][0]
@@ -514,9 +699,7 @@ def test_websocket_transport_records_four_phase_timeline(tmp_path):
 
 def test_websocket_url_is_derived_from_http_endpoint():
     assert (
-        bot_module.ModalTTSService._websocket_url(
-            "https://example.modal.run/v1/audio/speech"
-        )
+        bot_module.ModalTTSService._websocket_url("https://example.modal.run/v1/audio/speech")
         == "wss://example.modal.run/v1/audio/speech/ws"
     )
 
@@ -526,22 +709,16 @@ def test_realtime_websocket_streams_llm_chunks_and_records_audio(tmp_path):
         _run_local_pipeline(
             tmp_path,
             tts_transport="realtime_websocket",
-            duration_seconds=1.1,
+            duration_seconds=2.5,
         )
     )
 
     result = results[0]
-    timelines = [
-        turn["tts_requests"][0]
-        for turn in result["turns"]
-        if turn["tts_requests"]
-    ]
+    timelines = [turn["tts_requests"][0] for turn in result["turns"] if turn["tts_requests"]]
     assert result["success"] is True
     assert result["errors"] == []
     assert len(timelines) >= 2
-    assert {timeline["transport"] for timeline in timelines} == {
-        "realtime_websocket"
-    }
+    assert {timeline["transport"] for timeline in timelines} == {"realtime_websocket"}
     assert {timeline["websocket_connection_id"] for timeline in timelines} == {
         "local-realtime-connection"
     }
@@ -555,8 +732,21 @@ def test_realtime_websocket_streams_llm_chunks_and_records_audio(tmp_path):
     assert all(timeline["first_playable_ttfa_ms"] is not None for timeline in timelines)
     assert all(timeline["body_chunk_count"] == 3 for timeline in timelines)
     assert all(timeline["body_bytes"] == 14_400 for timeline in timelines)
+    assert all(timeline["first_chunk_processing_ms"] is not None for timeline in timelines)
+    assert all(
+        timeline["max_chunk_processing_ms"] >= timeline["first_chunk_processing_ms"]
+        for timeline in timelines
+    )
+    assert all(timeline["first_chunk_metrics_push_ms"] is not None for timeline in timelines)
+    assert all(
+        timeline["max_chunk_metrics_push_ms"] >= timeline["first_chunk_metrics_push_ms"]
+        for timeline in timelines
+    )
     assert all(timeline["attempt_count"] == 1 for timeline in timelines)
     assert all(timeline["websocket_receive_to_vllm_send_ms"] == 1.25 for timeline in timelines)
+    assert all(
+        timeline["first_text_receive_to_segment_enqueue_ms"] == 5.0 for timeline in timelines
+    )
     assert all(timeline["vllm_send_to_first_24khz_audio_ms"] == 2.5 for timeline in timelines)
     assert all(
         timeline["first_24khz_audio_to_first_8khz_pcm_sent_ms"] == 0.75 for timeline in timelines
@@ -564,13 +754,20 @@ def test_realtime_websocket_streams_llm_chunks_and_records_audio(tmp_path):
     assert all(timeline["segment_queue_ms"] == [0.5] for timeline in timelines)
     assert all(timeline["segment_first_audio_ms"] == [3.25] for timeline in timelines)
     assert all(timeline["segment_generation_ms"] == [20.0] for timeline in timelines)
+    assert all(timeline["upstream_pcm_first_to_second_chunk_ms"] == [4.0] for timeline in timelines)
+    assert all(timeline["upstream_pcm_mean_chunk_gap_ms"] == [5.0] for timeline in timelines)
+    assert all(timeline["upstream_pcm_max_chunk_gap_ms"] == [6.0] for timeline in timelines)
     assert all(len(timeline["realtime_segments"]) == 1 for timeline in timelines)
+    assert all(
+        timeline["realtime_segments"][0]["segment_enqueue_to_vllm_send_ms"] == 1.0
+        for timeline in timelines
+    )
 
     report = build_load_report(
         config,
         results,
         concurrency=1,
-        duration_seconds=1.1,
+        duration_seconds=2.5,
         phase_wall_seconds=results[0]["actual_call_seconds"],
         modal_average_containers=1,
     )
@@ -585,7 +782,315 @@ def test_realtime_websocket_url_uses_native_8khz_pcm():
         language="English",
     ) == (
         "wss://example.modal.run/v1/text-to-speech/aiden/stream-input"
-        "?output_format=pcm_8000&inactivity_timeout=30&language=English"
+        "?output_format=pcm_8000&inactivity_timeout=180&language=English"
+    )
+
+
+def test_realtime_idle_pings_preserve_socket_between_turns(tmp_path, monkeypatch):
+    # Compress a quiet period beyond the server timeout without a 30-second test.
+    monkeypatch.setattr(bot_module, "QWEN_APPLICATION_PING_INTERVAL_SECONDS", 0.03)
+    events = []
+    counters_before = tts_session_counters()
+    _, results = asyncio.run(
+        _run_local_pipeline(
+            tmp_path,
+            tts_transport="realtime_websocket",
+            duration_seconds=2.2,
+            wait_after_seconds=0.4,
+            realtime_idle_timeout_seconds=0.2,
+            realtime_events=events,
+        )
+    )
+    result = results[0]
+    timelines = [turn["tts_requests"][0] for turn in result["turns"]]
+    assert result["success"] is True
+    assert result["errors"] == []
+    assert len(timelines) >= 2
+    assert events.count({"type": "connected"}) == 1
+    assert events.count({"type": "ping"}) >= 2
+    assert events[-1] == {"type": "close"}
+    assert all(timeline["connection_reused"] for timeline in timelines[1:])
+    assert all(timeline["body_chunk_count"] == 3 for timeline in timelines)
+    assert all(timeline["body_bytes"] == 14_400 for timeline in timelines)
+    counters_after = tts_session_counters()
+    assert counters_after["sessions_active"] == counters_before["sessions_active"]
+    assert counters_after["sessions_created"] - counters_before["sessions_created"] == 1
+    assert counters_after["sessions_closed"] - counters_before["sessions_closed"] == 1
+
+
+def _keepalive_test_service():
+    config = SimpleNamespace(
+        model="qwen3-tts-1.7b",
+        tts_voice="Vivian",
+        tts_language="English",
+        tts_timeout_seconds=1,
+        tts_url="https://example.test?inactivity_timeout=6",
+        tts_bearer_token=None,
+    )
+    return bot_module.QwenRealtimeTTSService(config, _call_state())
+
+
+@pytest.mark.parametrize("flush", [False, True])
+def test_realtime_text_and_flush_postpone_idle_ping(flush):
+    async def exercise():
+        service = _keepalive_test_service()
+        ping_received = asyncio.Event()
+        ping_times = []
+
+        async def send_json(event):
+            if event == {"type": "ping"}:
+                ping_times.append(time.perf_counter())
+                ping_received.set()
+
+        websocket = SimpleNamespace(closed=False, send_json=send_json)
+        service._websocket = websocket
+        service._ensure_request = Mock(
+            return_value=(SimpleNamespace(websocket_send_started_at=1.0), None)
+        )
+        service._last_application_send_at = time.perf_counter()
+        task = asyncio.create_task(service._send_idle_pings(websocket, 0.1))
+        service._keepalive_task = task
+        try:
+            await asyncio.sleep(0.06)
+            await service._send_text(
+                bot_module.RealtimeTTSContext(context_id="turn-1"),
+                "" if flush else "Hello",
+                flush=flush,
+            )
+            sent_at = service._last_application_send_at
+            await asyncio.wait_for(ping_received.wait(), timeout=1)
+            assert ping_times[0] - sent_at >= 0.1
+            service._final_received.set()
+            await asyncio.wait_for(task, timeout=1)
+            assert len(ping_times) == 1
+        finally:
+            await service._stop_keepalive()
+        assert task.done()
+        assert service._keepalive_task is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("graceful", [False, True])
+def test_realtime_close_cancels_pending_idle_ping(graceful):
+    async def exercise():
+        service = _keepalive_test_service()
+        websocket = SimpleNamespace(closed=False, send_json=AsyncMock(), close=AsyncMock())
+        service._websocket = websocket
+        service._last_application_send_at = time.perf_counter()
+        task = asyncio.create_task(service._send_idle_pings(websocket, 10))
+        service._keepalive_task = task
+        await asyncio.sleep(0)
+        await service._close(graceful=graceful)
+        assert task.cancelled()
+        assert service._keepalive_task is None
+        websocket.send_json.assert_not_awaited()
+        websocket.close.assert_awaited_once()
+
+    asyncio.run(exercise())
+
+
+def test_realtime_ping_failure_closes_socket():
+    async def exercise():
+        service = _keepalive_test_service()
+        error = OSError("socket failed")
+        websocket = SimpleNamespace(
+            closed=False, send_json=AsyncMock(side_effect=error), close=AsyncMock()
+        )
+        service._websocket = websocket
+        service._last_application_send_at = time.perf_counter() - 20
+        await service._send_idle_pings(websocket, 10)
+        assert service._connection_error is error
+        websocket.close.assert_awaited_once()
+
+    asyncio.run(exercise())
+
+
+def test_realtime_reconnect_replaces_keepalive_and_honors_shorter_timeout():
+    async def exercise():
+        service = _keepalive_test_service()
+        old_socket = SimpleNamespace(closed=False, close=AsyncMock())
+        service._websocket = old_socket
+        old_receiver = asyncio.create_task(asyncio.Event().wait())
+        service._receiver_task = old_receiver
+        old_keepalive = asyncio.create_task(asyncio.Event().wait())
+        service._keepalive_task = old_keepalive
+        new_socket = SimpleNamespace(
+            closed=False,
+            receive=AsyncMock(
+                return_value=SimpleNamespace(
+                    type=web.WSMsgType.TEXT,
+                    data=json.dumps(
+                        {
+                            "type": "ready",
+                            "sample_rate": 8000,
+                            "channels": 1,
+                            "encoding": "pcm_s16le",
+                        }
+                    ),
+                )
+            ),
+            close=AsyncMock(),
+        )
+        service._session = SimpleNamespace(ws_connect=AsyncMock(return_value=new_socket))
+        service._receive_audio = AsyncMock()
+        service._send_idle_pings = AsyncMock()
+        try:
+            await service._connect()
+            await asyncio.sleep(0)
+            assert old_receiver.cancelled()
+            assert old_keepalive.cancelled()
+            old_socket.close.assert_awaited_once()
+            assert service._websocket is new_socket
+            service._send_idle_pings.assert_awaited_once_with(new_socket, 2.0)
+        finally:
+            service._session = None
+            await service._close(graceful=False)
+
+    asyncio.run(exercise())
+
+
+def test_realtime_connect_retries_one_transport_failure(monkeypatch):
+    async def exercise():
+        service = _keepalive_test_service()
+        new_socket = SimpleNamespace(
+            closed=False,
+            receive=AsyncMock(
+                return_value=SimpleNamespace(
+                    type=web.WSMsgType.TEXT,
+                    data=json.dumps(
+                        {
+                            "type": "ready",
+                            "sample_rate": 8000,
+                            "channels": 1,
+                            "encoding": "pcm_s16le",
+                        }
+                    ),
+                )
+            ),
+            close=AsyncMock(),
+        )
+        connect = AsyncMock(side_effect=[TimeoutError("handshake timed out"), new_socket])
+        service._session = SimpleNamespace(ws_connect=connect)
+        service._receive_audio = AsyncMock()
+        service._send_idle_pings = AsyncMock()
+        monkeypatch.setattr(bot_module.random, "uniform", lambda *_args: 0.0)
+        try:
+            await service._connect()
+            await asyncio.sleep(0)
+            assert connect.await_count == 2
+            assert service._websocket is new_socket
+            assert service.connection_error is None
+        finally:
+            service._session = None
+            await service._close(graceful=False)
+
+    asyncio.run(exercise())
+
+
+def test_failed_realtime_handshake_fails_one_turn_then_reconnects(monkeypatch):
+    async def exercise():
+        service = _keepalive_test_service()
+        new_socket = SimpleNamespace(
+            closed=False,
+            receive=AsyncMock(
+                return_value=SimpleNamespace(
+                    type=web.WSMsgType.TEXT,
+                    data=json.dumps(
+                        {
+                            "type": "ready",
+                            "sample_rate": 8000,
+                            "channels": 1,
+                            "encoding": "pcm_s16le",
+                        }
+                    ),
+                )
+            ),
+            close=AsyncMock(),
+        )
+        connect = AsyncMock(
+            side_effect=[
+                TimeoutError("first handshake timed out"),
+                TimeoutError("retry timed out"),
+                new_socket,
+            ]
+        )
+        service._session = SimpleNamespace(ws_connect=connect)
+        service._receive_audio = AsyncMock()
+        service._send_idle_pings = AsyncMock()
+        monkeypatch.setattr(bot_module.random, "uniform", lambda *_args: 0.0)
+        try:
+            await service.on_turn_context_created("failed-turn")
+            first_frames = [frame async for frame in service.run_tts("Hello", "failed-turn")]
+            repeated_frames = [frame async for frame in service.run_tts(" again", "failed-turn")]
+            assert len(first_frames) == 1
+            assert isinstance(first_frames[0], ErrorFrame)
+            assert repeated_frames == []
+            assert service._is_transport_error(service.connection_error)
+
+            await service.flush_audio("failed-turn")
+            assert service._context is None
+
+            await service.on_turn_context_created("next-turn")
+            assert service._context is not None
+            assert service._context.error is None
+            assert service._websocket is new_socket
+            assert service.connection_error is None
+        finally:
+            service._context = None
+            service._session = None
+            await service._close(graceful=False)
+
+    asyncio.run(exercise())
+
+
+def test_realtime_websocket_url_preserves_latency_experiment_switches():
+    assert bot_module.QwenRealtimeTTSService._realtime_websocket_url(
+        "https://example.modal.run/?emit_segment_started=true&first_segment_max_wait_ms=0",
+        voice="Vivian",
+        language=None,
+    ) == (
+        "wss://example.modal.run/v1/text-to-speech/Vivian/stream-input"
+        "?output_format=pcm_8000&inactivity_timeout=180"
+        "&emit_segment_started=true&first_segment_max_wait_ms=0"
+    )
+
+
+def test_elevenlabs_websocket_reuses_one_socket_across_turns(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot_module, "QWEN_APPLICATION_PING_INTERVAL_SECONDS", 0.03)
+    _, results = asyncio.run(
+        _run_local_pipeline(
+            tmp_path,
+            tts_transport="elevenlabs_websocket",
+            duration_seconds=2.5,
+        )
+    )
+
+    result = results[0]
+    timelines = [turn["tts_requests"][0] for turn in result["turns"] if turn["tts_requests"]]
+    assert result["success"] is True
+    assert result["errors"] == []
+    assert len(timelines) >= 2
+    assert {timeline["transport"] for timeline in timelines} == {"elevenlabs_websocket"}
+    assert len({timeline["websocket_connection_id"] for timeline in timelines}) == 1
+    assert [timeline["websocket_request_on_connection"] for timeline in timelines] == list(
+        range(1, len(timelines) + 1)
+    )
+    assert timelines[0]["connection_reused"] is False
+    assert all(timeline["connection_reused"] is True for timeline in timelines[1:])
+    assert all(timeline["first_playable_ttfa_ms"] is not None for timeline in timelines)
+    assert all(timeline["body_chunk_count"] == 3 for timeline in timelines)
+    assert all(timeline["body_bytes"] == 14_400 for timeline in timelines)
+
+
+def test_elevenlabs_websocket_url_uses_native_8khz_pcm():
+    assert bot_module.ElevenLabsWebsocketTTSService._realtime_websocket_url(
+        "https://api.elevenlabs.io/",
+        voice="voice/id",
+        model="eleven_flash_v2_5",
+    ) == (
+        "wss://api.elevenlabs.io/v1/text-to-speech/voice%2Fid/multi-stream-input"
+        "?model_id=eleven_flash_v2_5&output_format=pcm_8000&inactivity_timeout=180"
     )
 
 
@@ -770,6 +1275,18 @@ def test_mixed_scenario_rotates_all_scenarios_from_call_offset():
     assert [turn.wait_after_seconds for turn in mixed.turns] == [2, 3, 4, 1]
 
 
+def test_wav_retention_removes_unselected_recording(tmp_path, monkeypatch):
+    recording = tmp_path / "call.wav"
+    recording.write_bytes(b"audio")
+    result = {"recording": str(recording)}
+    monkeypatch.setattr(load_test_module.random, "random", lambda: 0.9)
+
+    asyncio.run(_apply_wav_retention(result, 10))
+
+    assert result["recording_retained"] is False
+    assert not recording.exists()
+
+
 def test_call_slots_replace_finished_calls_until_soak_deadline(tmp_path, monkeypatch):
     active_calls = 0
     max_active_calls = 0
@@ -809,6 +1326,7 @@ def test_call_slots_replace_finished_calls_until_soak_deadline(tmp_path, monkeyp
         return {
             "calls": calls,
             "summary": {},
+            "playback_gaps": {},
             "cost": {},
             "failure_breakdown": {},
             "thresholds": {"passed": True},
@@ -827,6 +1345,7 @@ def test_call_slots_replace_finished_calls_until_soak_deadline(tmp_path, monkeyp
         call_duration_seconds=0.03,
         ramp_seconds=0.0,
         output_dir=tmp_path,
+        wav_retention_percent=100.0,
         modal_average_containers=None,
     )
 

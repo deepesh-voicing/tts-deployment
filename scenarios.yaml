@@ -8,6 +8,7 @@ benchmark:
     playable_ttfa_p95_ms_max:
     playable_ttfa_p99_ms_max:
     playable_ttfa_p99_9_ms_max:
+    # Percentage of turns with a simulated playback underrun over 20 ms.
     playback_gap_rate_pct_max:
     rtf_p95_max:
     request_rate_achievement_pct_min:
