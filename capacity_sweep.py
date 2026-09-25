@@ -79,6 +79,7 @@ def _phase_args(load_test_argv: list[str], rate: float) -> argparse.Namespace:
 def _phase_row(rate: float, report: dict[str, Any], report_path: Path) -> dict[str, Any]:
     summary = report["summary"]
     ttfa = summary["first_playable_ttfa_ms_including_failures"]
+    text_ready_ttfa = summary.get("text_ready_ttfa_ms_including_failures") or {}
     return {
         "rate_per_minute": rate,
         "expected_active_calls": report["arrival"]["expected_active_calls"],
@@ -90,6 +91,8 @@ def _phase_row(rate: float, report: dict[str, Any], report_path: Path) -> dict[s
         "ttfa_p50_ms": ttfa["p50"],
         "ttfa_p95_ms": ttfa["p95"],
         "ttfa_p99_ms": ttfa["p99"],
+        "text_ready_ttfa_p95_ms": text_ready_ttfa.get("p95"),
+        "text_ready_ttfa_p99_ms": text_ready_ttfa.get("p99"),
         "turn_failure_rate_pct": report["rates"]["turn_failure_rate_pct"],
         "playback_gap_rate_pct": report["rates"]["playback_gap_rate_pct"],
         "rtf_weighted": report["rtf"]["weighted"],
@@ -134,6 +137,8 @@ TABLE_COLUMNS = (
     ("ttfa_p50_ms", "TTFA p50"),
     ("ttfa_p95_ms", "TTFA p95"),
     ("ttfa_p99_ms", "TTFA p99"),
+    ("text_ready_ttfa_p95_ms", "text-ready TTFA p95"),
+    ("text_ready_ttfa_p99_ms", "text-ready TTFA p99"),
     ("turn_failure_rate_pct", "turn fail %"),
     ("playback_gap_rate_pct", "gap %"),
     ("rtf_weighted", "RTF"),

@@ -1,0 +1,168 @@
+# Documentation-only effective-config snapshot; this file is not passed to vLLM.
+# Source: deploy_qwen3_tts_realtime.py + qwen3_tts_realtime_ramp.yaml,
+# checked against US-East v7 startup logs on 2026-09-24. No secrets are included.
+# The Modal deployment was built from a dirty checkout; its exact source/image
+# digest is not recoverable from these checks. Do not treat this as a lockfile.
+snapshot:
+  date: "2026-09-25"
+  scope: serve_realtime_us_east_gpu
+  deployment_app: tts-l40s-qwen3-tts-realtime
+  deployment_version_observed: 7
+  exact_deployed_source_verified: false
+  source_files:
+    wrapper: modal_apps/deploy_qwen3_tts_realtime.py
+    wrapper_sha256_local: 689da85dc89bddaaaa05c7052ccdf755af56f079181c6aaa3a36881374a8d45e
+    vllm_base_config: modal_apps/configs/qwen3_tts_realtime_ramp.yaml
+    vllm_base_config_sha256_local: b0b255a72cd258f856cc641801f04029a5023b307f4b280e97aa93cc58ffb468
+
+modal:
+  function: serve_realtime_us_east_gpu
+  endpoint: https://abhran--tts-l40s-qwen3-tts-realtime-serve-realtime-us-east-gpu.us-east.modal.run
+  gpu: L40S
+  compute_region: us-east
+  routing_region: us-east
+  max_inputs_per_container: 128
+  min_containers: 0
+  max_containers: 1
+  scaledown_window_seconds: 300
+  function_timeout_seconds: 600
+  startup_timeout_seconds: 1800
+  volume:
+    name: tts-l40s-cache
+    mount: /cache
+  secret_names: [huggingface-secret, qwen-tts-api-keys]
+
+image:
+  base: vllm/vllm-openai:v0.29.0
+  base_digest_verified: false
+  installed_packages:
+    vllm-omni: 0.29.0rc1
+    websockets: "17.1"
+  environment:
+    HF_HOME: /cache/huggingface
+    HF_HUB_CACHE: /cache/huggingface/hub
+    HF_XET_HIGH_PERFORMANCE: "1"
+    TORCH_HOME: /cache/torch
+    VLLM_WORKER_MULTIPROC_METHOD: spawn
+    VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS: "1"
+    VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS_LOG_EVERY: "100"
+    VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS: "1"
+
+vllm:
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+  model_revision: 0c0e3051f131929182e2c023b9537f8b1c68adfe
+  omni: true
+  deploy_config: /opt/tts/qwen3_tts_realtime_ramp.yaml
+  host: 0.0.0.0
+  port: 8000
+  log_stats: true
+  async_chunk: true
+  # Applied by --stage-overrides, despite the wrapper constant's AP_SOUTH name.
+  cli_stage_overrides:
+    "0": {max_num_seqs: 64, max_num_batched_tokens: 8192, kv_cache_dtype: fp8_e4m3}
+    "1": {max_num_seqs: 64}
+  override_resolution:
+    stage_0_max_num_batched_tokens_base: 32768
+    stage_0_max_num_batched_tokens_effective: 8192
+  connector:
+    name: SharedMemoryConnector
+    codec_streaming: true
+    connector_get_sleep_s: 0.01
+    connector_get_max_wait_first_chunk: 3000
+    connector_get_max_wait: 300
+    codec_chunk_frames: 25
+    codec_left_context_frames: 72
+    codec_chunk_ramp: [4, 4, 8, 16, 25]
+    decode_batch_max_size: 16
+    decode_cudagraph_batch_sizes: [1, 4, 8]
+  stages:
+    - stage_id: 0
+      devices: "0"
+      max_num_seqs: 64
+      max_num_batched_tokens: 8192
+      max_model_len: 4096
+      gpu_memory_utilization: 0.3
+      kv_cache_dtype: fp8_e4m3
+      trust_remote_code: true
+      enable_prefix_caching: false
+      async_scheduling: true
+      output_connectors: {to_stage_1: connector_of_shared_memory}
+      default_sampling_params:
+        temperature: 0.9
+        top_k: 50
+        max_tokens: 4096
+        min_tokens: 2
+        repetition_penalty: 1.05
+      silence_ban_frames: 0
+      subtalker_sampling_params:
+        do_sample: true
+        temperature: 0.9
+        top_k: 50
+        top_p: 1.0
+    - stage_id: 1
+      devices: "0"
+      max_num_seqs: 64
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+      gpu_memory_utilization: 0.3
+      enforce_eager: false
+      trust_remote_code: true
+      enable_prefix_caching: false
+      async_scheduling: true
+      input_connectors: {from_stage_0: connector_of_shared_memory}
+      default_sampling_params:
+        temperature: 0.0
+        top_p: 1.0
+        top_k: -1
+        max_tokens: 65536
+        repetition_penalty: 1.0
+  # ROCm and NPU blocks in the base YAML do not apply to this CUDA L40S.
+
+service:
+  public_realtime_route: /v1/text-to-speech/{voice_id}/stream-input
+  upstream_realtime_route: /v1/audio/speech/stream
+  task_type: CustomVoice
+  text_split_owner: vllm_omni
+  split_granularity: clause
+  model_audio_sample_rate_hz: 24000
+  output_audio_sample_rate_hz: 8000
+  output_format: pcm_8000
+  output_channels: 1
+  output_encoding: pcm_s16le
+  resampling: wrapper_pyav_24000_to_8000
+  max_text_message_bytes: 65536
+  max_utterance_characters: 4096
+  inactivity_timeout_seconds: {default: 30, min: 5, max: 180}
+  upstream_websocket: {open_timeout_seconds: 10, max_queue: 16}
+  internal_http_pool: {max_connections: 128, max_keepalive_connections: 128, keepalive_expiry: null}
+  legacy_http_route: /v1/audio/speech
+  legacy_http_default_voice: aiden
+  legacy_http_stream: true
+
+authentication:
+  modal_secret: qwen-tts-api-keys
+  environment_variable: TTS_API_KEYS_JSON
+  scheme: Authorization Bearer
+  stored_key_material: sha256_hash_only
+  websocket_connections_per_key: secret_record_max_connections
+  websocket_connections_per_key_default: 16
+  websocket_connections_per_key_allowed_range: [1, 128]
+  # A live 2026-09-24 handshake logged key_id=bot with max_connections=128.
+  observed_key_id: bot
+  observed_key_max_connections: 128
+  calls_per_minute_server_limit: null
+
+observability:
+  authenticated_metrics_route: /metrics
+  stage_metrics_log_interval_seconds: 1
+  gpu_metrics_log_interval_seconds: 1
+  code2wav_batch_stats: true
+  code2wav_cudagraph_stats: true
+  vllm_cudagraph_metrics: false
+  vllm_mfu_metrics: false
+
+qualification:
+  # Load-test operating target, not an enforced server rate limit or capacity guarantee.
+  tested_target_calls_per_minute: 18
+  tested_target_enforced_by_server: false
+  basis: matched_us_east_realtime_sweep_2026-09-24

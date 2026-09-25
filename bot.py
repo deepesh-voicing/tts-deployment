@@ -84,6 +84,9 @@ BENCHMARK_THRESHOLD_KEYS = {
     "playable_ttfa_p95_ms_max",
     "playable_ttfa_p99_ms_max",
     "playable_ttfa_p99_9_ms_max",
+    "text_ready_ttfa_p95_ms_max",
+    "text_ready_ttfa_p99_ms_max",
+    "text_ready_ttfa_p99_9_ms_max",
     "playback_gap_rate_pct_max",
     "rtf_p95_max",
     "request_rate_achievement_pct_min",
@@ -93,6 +96,9 @@ THRESHOLD_MIN_SAMPLES = {
     "playable_ttfa_p95_ms_max": 20,
     "playable_ttfa_p99_ms_max": 100,
     "playable_ttfa_p99_9_ms_max": 1_000,
+    "text_ready_ttfa_p95_ms_max": 20,
+    "text_ready_ttfa_p99_ms_max": 100,
+    "text_ready_ttfa_p99_9_ms_max": 1_000,
     "rtf_p95_max": 20,
 }
 REALTIME_SAMPLE_RATE = 8_000
@@ -275,6 +281,8 @@ class TTSRequest:
     # Gaps that began after the full text reached the TTS; earlier gaps may be LLM pacing.
     max_body_chunk_gap_after_text_seconds: float = 0.0
     text_complete_at: float | None = None
+    # (sent_at, total characters sent so far) for each streamed text message.
+    text_sends: list[tuple[float, int]] = field(default_factory=list)
     body_chunk_count: int = 0
     body_bytes: int = 0
     first_chunk_processing_seconds: float | None = None
@@ -1606,6 +1614,7 @@ class QwenRealtimeTTSService(TTSService):
             }
         )
         self._last_application_send_at = time.perf_counter()
+        _record_text_sent(request, text)
         if first_send:
             ModalTTSService._record_websocket_send_complete(request, attempt)
 
@@ -2006,6 +2015,7 @@ class ElevenLabsWebsocketTTSService(QwenRealtimeTTSService):
                 "flush": flush,
             }
         )
+        _record_text_sent(request, text)
         if first_send:
             ModalTTSService._record_websocket_send_complete(request, attempt)
 
@@ -2323,6 +2333,39 @@ def _elapsed_ms(start: float, end: float | None) -> float | None:
     return round((end - start) * 1000, 3) if end is not None else None
 
 
+def _record_text_sent(request: TTSRequest, text: str) -> None:
+    if not text:
+        return
+    sent_characters = request.text_sends[-1][1] if request.text_sends else 0
+    request.text_sends.append((time.perf_counter(), sent_characters + len(text)))
+
+
+def _first_segment_text_ready_at(request: TTSRequest) -> float:
+    """When the TTS had all the text of the first spoken segment.
+
+    vLLM's clause splitter confirms a boundary only once the character after the
+    punctuation arrives, or at the flush, so the first segment is ready when one
+    character past it was sent. Requests without segment sizes (HTTP, or servers
+    that do not report them) count from the request start.
+    """
+    segments = request.realtime_segments
+    characters = segments[0].get("text_characters") if segments else None
+    if not isinstance(characters, int) or isinstance(characters, bool) or characters <= 0:
+        return request.started_at
+    leading_whitespace = len(request.text) - len(request.text.lstrip())
+    needed = leading_whitespace + characters + 1
+    ready_at = next(
+        (sent_at for sent_at, sent in request.text_sends if sent >= needed),
+        request.text_complete_at,
+    )
+    if ready_at is None or (
+        request.first_playable_at is not None and ready_at > request.first_playable_at
+    ):
+        # Audio before the computed boundary means the server split differently.
+        return request.started_at
+    return ready_at
+
+
 def _wall_elapsed_ms(start_ns: int | None, end_ns: int | None) -> float | None:
     if start_ns is None or end_ns is None:
         return None
@@ -2473,6 +2516,7 @@ def _tts_attempt_report(attempt: TTSAttempt) -> dict[str, Any]:
 def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
     first_body_ms = _elapsed_ms(request.started_at, request.first_body_at)
     first_playable_ttfa_ms = _elapsed_ms(request.started_at, request.first_playable_at)
+    text_ready_at = _first_segment_text_ready_at(request)
     request_ms = _elapsed_ms(request.started_at, request.ended_at)
     audio_duration_ms = request.audio_bytes / (request.sample_rate * 2) * 1000
     receive_to_vllm_ms = _first_segment_metric(
@@ -2530,6 +2574,7 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
             if request.text_complete_at is not None
             else None
         ),
+        "text_ready_ms": _elapsed_ms(request.started_at, text_ready_at),
         "max_body_chunk_gap_ms": round(request.max_body_chunk_gap_seconds * 1000, 3),
         "max_body_chunk_gap_after_text_ms": round(
             request.max_body_chunk_gap_after_text_seconds * 1000,
@@ -2613,6 +2658,7 @@ def _tts_request_report(request: TTSRequest) -> dict[str, Any]:
             else None
         ),
         "first_playable_ttfa_ms": first_playable_ttfa_ms,
+        "text_ready_ttfa_ms": _elapsed_ms(text_ready_at, request.first_playable_at),
         "playable_gate_ms": (
             round((request.first_playable_at - request.first_body_at) * 1000, 3)
             if request.first_playable_at is not None and request.first_body_at is not None
@@ -2739,6 +2785,11 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
         for request in request_reports
         if request["first_playable_ttfa_ms"] is not None
     ]
+    text_ready_ttfa_ms = [
+        request["text_ready_ttfa_ms"]
+        for request in request_reports
+        if request["text_ready_ttfa_ms"] is not None
+    ]
     all_requests_playable = all(
         request.first_playable_at is not None for request in turn.tts_requests
     )
@@ -2777,6 +2828,12 @@ def _turn_report(turn: TurnState, sample_rate: int) -> dict[str, Any]:
         ],
         "first_body_ms": first_body_ms,
         "first_playable_ttfa_ms": first_playable_ttfa_ms,
+        "text_ready_ttfa_ms": text_ready_ttfa_ms,
+        "text_ready_ms": [
+            request["text_ready_ms"]
+            for request in request_reports
+            if request["text_ready_ms"] is not None
+        ],
         "tts_ttfa_ms": first_body_ms,
         "playable_gate_ms": [
             request["playable_gate_ms"]
@@ -3053,6 +3110,8 @@ async def run_call(
         "first_playable_ttfa_ms": [
             value for turn in turns for value in turn["first_playable_ttfa_ms"]
         ],
+        "text_ready_ttfa_ms": [value for turn in turns for value in turn["text_ready_ttfa_ms"]],
+        "text_ready_ms": [value for turn in turns for value in turn["text_ready_ms"]],
         "tts_ttfa_ms": [value for turn in turns for value in turn["tts_ttfa_ms"]],
         "playable_gate_ms": [value for turn in turns for value in turn["playable_gate_ms"]],
         "tts_request_ms": [value for turn in turns for value in turn["tts_request_ms"]],
@@ -3222,14 +3281,17 @@ def _turn_in_window(turn: dict[str, Any], window_ns: tuple[int, int] | None) -> 
     return window_ns[0] <= started_wall_ns < window_ns[1]
 
 
-def _tts_ttfa_population(turns: list[dict[str, Any]]) -> tuple[list[float], int]:
-    """Per-turn playable TTFA for turns that reached the TTS, plus TTS failure count."""
+def _tts_ttfa_population(
+    turns: list[dict[str, Any]],
+    field_name: str = "first_playable_ttfa_ms",
+) -> tuple[list[float], int]:
+    """Per-turn TTFA for turns that reached the TTS, plus TTS failure count."""
     values = []
     failures = 0
     for turn in turns:
         outcome = turn.get("tts_outcome")
         if outcome == "ok":
-            values.append(turn["first_playable_ttfa_ms"][0])
+            values.append(turn[field_name][0])
         elif outcome == "failed":
             failures += 1
     return values, failures
@@ -3510,6 +3572,8 @@ def build_load_report(
         "response_headers_ms",
         "first_body_ms",
         "first_playable_ttfa_ms",
+        "text_ready_ttfa_ms",
+        "text_ready_ms",
         "tts_ttfa_ms",
         "playable_gate_ms",
         "pipecat_tts_ttfa_ms",
@@ -3551,6 +3615,12 @@ def build_load_report(
     ttfa_values, tts_turn_failures = _tts_ttfa_population(turns)
     ttfa_including_failures = _distribution_with_failures(ttfa_values, tts_turn_failures)
     distributions["first_playable_ttfa_ms_including_failures"] = ttfa_including_failures
+    text_ready_ttfa_values, _ = _tts_ttfa_population(turns, "text_ready_ttfa_ms")
+    text_ready_ttfa_including_failures = _distribution_with_failures(
+        text_ready_ttfa_values,
+        tts_turn_failures,
+    )
+    distributions["text_ready_ttfa_ms_including_failures"] = text_ready_ttfa_including_failures
     runtime = _runtime_report(runtime_observations)
     if runtime is not None:
         distributions["event_loop_lag_ms"] = runtime["event_loop_lag_ms"]
@@ -3632,6 +3702,9 @@ def build_load_report(
         "playable_ttfa_p95_ms_max": ttfa_including_failures["p95"],
         "playable_ttfa_p99_ms_max": ttfa_including_failures["p99"],
         "playable_ttfa_p99_9_ms_max": ttfa_including_failures["p99_9"],
+        "text_ready_ttfa_p95_ms_max": text_ready_ttfa_including_failures["p95"],
+        "text_ready_ttfa_p99_ms_max": text_ready_ttfa_including_failures["p99"],
+        "text_ready_ttfa_p99_9_ms_max": text_ready_ttfa_including_failures["p99_9"],
         "playback_gap_rate_pct_max": rates["playback_gap_rate_pct"],
         "rtf_p95_max": distributions["rtf"]["p95"],
         "request_rate_achievement_pct_min": (
@@ -3644,6 +3717,9 @@ def build_load_report(
         "playable_ttfa_p95_ms_max": ttfa_including_failures["count"],
         "playable_ttfa_p99_ms_max": ttfa_including_failures["count"],
         "playable_ttfa_p99_9_ms_max": ttfa_including_failures["count"],
+        "text_ready_ttfa_p95_ms_max": text_ready_ttfa_including_failures["count"],
+        "text_ready_ttfa_p99_ms_max": text_ready_ttfa_including_failures["count"],
+        "text_ready_ttfa_p99_9_ms_max": text_ready_ttfa_including_failures["count"],
         "rtf_p95_max": distributions["rtf"]["count"],
     }
     threshold_results = _threshold_report(
@@ -3734,6 +3810,7 @@ def build_load_report(
         },
         "tail_breaches": {
             "first_playable_ttfa_ms": _tail_breaches(ttfa_values, tts_turn_failures),
+            "text_ready_ttfa_ms": _tail_breaches(text_ready_ttfa_values, tts_turn_failures),
             "tts_request_ms": _tail_breaches(
                 [request["request_ms"] for request in requests if request["request_ms"] is not None]
             ),
@@ -3826,7 +3903,12 @@ def build_load_report(
         "ttfa_note": (
             "Thresholds on playable TTFA use first_playable_ttfa_ms_including_failures: one "
             "sample per turn that reached the TTS, where a failed turn ranks above every "
-            "success. A percentile that lands on a failure is null and fails its threshold."
+            "success. A percentile that lands on a failure is null and fails its threshold. "
+            "first_playable_ttfa_ms starts at the first LLM text sent, so on streaming "
+            "transports it includes the LLM streaming the first clause. text_ready_ttfa_ms "
+            "starts once the first spoken segment's text was sent (text_ready_ms after the "
+            "request start), so it covers only network, server queueing and generation; "
+            "the text_ready_ttfa_* thresholds use it the same way."
         ),
         "tts_timeline_note": (
             "response_headers_ms is HTTP response headers, first_body_ms is the first arbitrary "

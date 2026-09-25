@@ -770,6 +770,12 @@ def test_realtime_websocket_streams_llm_chunks_and_records_audio(tmp_path):
     assert all(timeline["rtf_source"] == "server_generation" for timeline in timelines)
     assert all(timeline["rtf"] == round(20.0 / 900.0, 6) for timeline in timelines)
     assert all(timeline["text_complete_ms"] is not None for timeline in timelines)
+    # The one segment spans the whole reply, so it was only ready at the flush.
+    assert all(timeline["text_ready_ms"] == timeline["text_complete_ms"] for timeline in timelines)
+    assert all(
+        0 <= timeline["text_ready_ttfa_ms"] <= timeline["first_playable_ttfa_ms"]
+        for timeline in timelines
+    )
     assert all(timeline["upstream_pcm_first_to_second_chunk_ms"] == [4.0] for timeline in timelines)
     assert all(timeline["upstream_pcm_mean_chunk_gap_ms"] == [5.0] for timeline in timelines)
     assert all(timeline["upstream_pcm_max_chunk_gap_ms"] == [6.0] for timeline in timelines)
@@ -861,7 +867,7 @@ def test_realtime_text_and_flush_postpone_idle_ping(flush):
         websocket = SimpleNamespace(closed=False, send_json=send_json)
         service._websocket = websocket
         service._ensure_request = Mock(
-            return_value=(SimpleNamespace(websocket_send_started_at=1.0), None)
+            return_value=(SimpleNamespace(websocket_send_started_at=1.0, text_sends=[]), None)
         )
         service._last_application_send_at = time.perf_counter()
         task = asyncio.create_task(service._send_idle_pings(websocket, 0.1))
@@ -1445,12 +1451,15 @@ def _report_config():
     )
 
 
-def _synthetic_turn(ttfa_ms, *, started_wall_ns=None):
+def _synthetic_turn(ttfa_ms, *, started_wall_ns=None, text_ready_ttfa_ms=None):
+    if text_ready_ttfa_ms is None:
+        text_ready_ttfa_ms = ttfa_ms
     return {
         "started_wall_ns": started_wall_ns,
         "failed": ttfa_ms is None,
         "tts_outcome": "ok" if ttfa_ms is not None else "failed",
         "first_playable_ttfa_ms": [] if ttfa_ms is None else [ttfa_ms],
+        "text_ready_ttfa_ms": [] if text_ready_ttfa_ms is None else [text_ready_ttfa_ms],
         "tts_requests": [],
         "playback_gap_ms": [],
     }
@@ -1505,6 +1514,26 @@ def test_failed_turns_count_against_ttfa_percentiles():
     assert report["rates"]["turn_failure_rate_pct"] == 3.0
     assert report["rates"]["tts_turn_failure_rate_pct"] == 3.0
     assert report["tail_breaches"]["first_playable_ttfa_ms"]["over_1000_ms"]["count"] == 3
+
+
+def test_text_ready_ttfa_thresholds_exclude_llm_streaming():
+    # The LLM took 600 ms to finish each first clause; the TTS then took 300 ms.
+    turns = [_synthetic_turn(900.0, text_ready_ttfa_ms=300.0) for _ in range(99)]
+    turns.append(_synthetic_turn(None))
+
+    report = _build_synthetic_report(
+        turns,
+        thresholds={"playable_ttfa_p95_ms_max": 500, "text_ready_ttfa_p95_ms_max": 500},
+    )
+
+    text_ready = report["summary"]["text_ready_ttfa_ms_including_failures"]
+    assert text_ready["count"] == 100
+    assert text_ready["failures"] == 1
+    assert text_ready["p95"] == 300.0
+    checks = report["thresholds"]["checks"]
+    assert checks["playable_ttfa_p95_ms_max"]["passed"] is False
+    assert checks["text_ready_ttfa_p95_ms_max"]["passed"] is True
+    assert report["tail_breaches"]["text_ready_ttfa_ms"]["over_1000_ms"]["count"] == 1
 
 
 def test_percentile_threshold_needs_enough_samples():
@@ -1585,6 +1614,90 @@ def test_realtime_rtf_uses_server_generation_time():
     assert report["rtf_source"] == "server_generation"
     # The client-side value includes the time the LLM spent streaming text.
     assert report["wall_rtf"] == 1.5
+
+
+def _text_ready_request(text, *, segment_characters, text_sends, first_playable_at):
+    return bot_module.TTSRequest(
+        trace_id="trace",
+        bot_number=1,
+        turn_number=1,
+        text=text,
+        sample_rate=8_000,
+        started_at=1.0,
+        started_wall_ns=0,
+        transport="realtime_websocket",
+        text_complete_at=2.0,
+        text_sends=text_sends,
+        first_playable_at=first_playable_at,
+        realtime_segments=(
+            [{"text_characters": segment_characters}] if segment_characters is not None else []
+        ),
+    )
+
+
+def test_text_ready_ttfa_starts_when_the_first_clause_is_confirmed():
+    # "Sure," is confirmed only once the space after the comma arrives.
+    request = _text_ready_request(
+        "Sure, the code is five.",
+        segment_characters=5,
+        text_sends=[(1.0, 4), (1.2, 5), (1.4, 9), (1.9, 23)],
+        first_playable_at=1.8,
+    )
+
+    report = bot_module._tts_request_report(request)
+
+    assert report["first_playable_ttfa_ms"] == 800.0
+    assert report["text_ready_ms"] == pytest.approx(400.0)
+    assert report["text_ready_ttfa_ms"] == pytest.approx(400.0)
+
+
+def test_text_ready_ttfa_waits_for_flush_when_the_reply_is_one_clause():
+    text = "The postal code is one zero zero one six."
+    request = _text_ready_request(
+        text,
+        segment_characters=len(text),
+        text_sends=[(1.0, 10), (1.5, len(text))],
+        first_playable_at=2.3,
+    )
+
+    report = bot_module._tts_request_report(request)
+
+    assert report["text_ready_ms"] == pytest.approx(1000.0)
+    assert report["text_ready_ttfa_ms"] == pytest.approx(300.0)
+
+
+@pytest.mark.parametrize(
+    ("segment_characters", "first_playable_at"),
+    [
+        # No segment sizes reported, as with HTTP or ElevenLabs.
+        (None, 1.8),
+        # Audio arrived before the computed boundary, so the server split differently.
+        (40, 1.8),
+    ],
+)
+def test_text_ready_ttfa_falls_back_to_request_start(segment_characters, first_playable_at):
+    request = _text_ready_request(
+        "Sure, the code is five.",
+        segment_characters=segment_characters,
+        text_sends=[(1.0, 4), (1.9, 23)],
+        first_playable_at=first_playable_at,
+    )
+
+    report = bot_module._tts_request_report(request)
+
+    assert report["text_ready_ms"] == 0.0
+    assert report["text_ready_ttfa_ms"] == report["first_playable_ttfa_ms"]
+
+
+def test_text_sends_track_cumulative_characters():
+    request = _text_ready_request("", segment_characters=None, text_sends=[], first_playable_at=None)
+
+    with patch("bot.time.perf_counter", side_effect=[1.0, 1.1]):
+        bot_module._record_text_sent(request, "Hello ")
+        bot_module._record_text_sent(request, "")
+        bot_module._record_text_sent(request, "there.")
+
+    assert request.text_sends == [(1.0, 6), (1.1, 12)]
 
 
 def test_body_gaps_before_text_is_complete_are_not_transport_stalls():

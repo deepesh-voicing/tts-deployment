@@ -9,11 +9,18 @@ benchmark:
     final_failure_rate_pct_max:
     # Percentage of turns that failed (error, timeout, or no audible audio).
     turn_failure_rate_pct_max:
-    # Playable TTFA percentiles count failed turns as slower than every success, and need
+    # TTFA percentiles count failed turns as slower than every success, and need
     # at least 20 / 100 / 1000 turns for p95 / p99 / p99.9.
-    playable_ttfa_p95_ms_max: 500
-    playable_ttfa_p99_ms_max: 600
+    # Playable TTFA starts at the first LLM text sent, so with streamed text it also
+    # counts the LLM finishing the first clause.
+    playable_ttfa_p95_ms_max:
+    playable_ttfa_p99_ms_max:
     playable_ttfa_p99_9_ms_max:
+    # Text-ready TTFA starts once the first spoken segment's text was sent: network,
+    # server queueing and generation only.
+    text_ready_ttfa_p95_ms_max: 500
+    text_ready_ttfa_p99_ms_max: 600
+    text_ready_ttfa_p99_9_ms_max:
     # Percentage of turns with a simulated playback underrun over 20 ms.
     playback_gap_rate_pct_max: 0.1
     rtf_p95_max:

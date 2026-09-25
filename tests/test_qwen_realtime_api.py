@@ -149,12 +149,12 @@ def test_realtime_keeps_stage_1_capacity_at_64(realtime_module):
 def test_realtime_uses_ramped_codec_chunk_schedule(realtime_module):
     assert realtime_module.DEPLOY_CONFIG_PATH == "/opt/tts/qwen3_tts_realtime_ramp.yaml"
     assert realtime_module.CODEC_CHUNK_FRAMES == 25
-    assert realtime_module.CODEC_CHUNK_RAMP == (4, 4, 8, 16, 25)
+    assert realtime_module.CODEC_CHUNK_RAMP == (2, 4, 8, 16, 25)
     assert realtime_module.CODEC_LEFT_CONTEXT_FRAMES == 72
 
     config = DEPLOY_CONFIG_PATH.read_text()
     assert "codec_chunk_frames: 25" in config
-    assert "codec_chunk_ramp: [4, 4, 8, 16, 25]" in config
+    assert "codec_chunk_ramp: [2, 4, 8, 16, 25]" in config
     assert "codec_left_context_frames: 72" in config
     assert "decode_batch_max_size: 16" in config
     assert "decode_cudagraph_batch_sizes: [1, 4, 8]" in config

@@ -32,7 +32,7 @@ SOURCE_SAMPLE_RATE = 24_000
 OUTPUT_SAMPLE_RATE = 8_000
 DEPLOY_CONFIG_PATH = "/opt/tts/qwen3_tts_realtime_ramp.yaml"
 CODEC_CHUNK_FRAMES = 25
-CODEC_CHUNK_RAMP = (4, 4, 8, 16, 25)
+CODEC_CHUNK_RAMP = (2, 4, 8, 16, 25)
 CODEC_LEFT_CONTEXT_FRAMES = 72
 DEFAULT_STAGE_OVERRIDES = (
     '{"0":{"max_num_seqs":64,"kv_cache_dtype":"fp8_e4m3"},"1":{"max_num_seqs":8}}'
