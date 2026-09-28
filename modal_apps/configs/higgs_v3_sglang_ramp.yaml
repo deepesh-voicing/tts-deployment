@@ -1,0 +1,21 @@
+# SGLang-Omni Higgs Audio v3: 5-frame first chunk with a gentle chunk ramp, no other change.
+#
+# Cadence with HIGGS_STREAM_CHUNK_RAMP=2,3,4,5,7,9,12 (set by deploy_higgs_v3_sglang.py and
+# applied by patches/patch_sglang_higgs_chunk_ramp.py):
+#   first chunk: 5 frames at 5 + 7 = 12 rows (3 decode steps sooner than first8);
+#   then chunks of 2, 3, 4, 5, 7, 9 and 12 frames, each holding back 4 frames;
+#   then 14-frame chunks (stream_followup_stride). Every chunk arrives before the audio
+#   already sent runs out while a decode step takes up to ~30 ms (c64 15-minute p95).
+# stream_stride only gates the first chunk (initial_chunk_frames < stream_stride - 7).
+config_cls: HiggsTtsPipelineConfig
+model_path: bosonai/higgs-audio-v3-tts-4b
+stages:
+  tts_engine:
+    engine:
+      max_running_requests: 64
+      cuda_graph_max_bs: 64
+  vocoder:
+    factory:
+      initial_chunk_frames: 5
+      stream_stride: 16
+      stream_followup_stride: 14

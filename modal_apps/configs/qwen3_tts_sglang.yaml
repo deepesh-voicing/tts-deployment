@@ -1,0 +1,14 @@
+# SGLang-Omni 0.1.6 Qwen3-TTS CustomVoice profile for the 8 kHz Modal wrapper.
+#
+# Engine A/B against the frozen vLLM-Omni deployment (deploy_qwen3_tts_realtime.py,
+# serve_realtime_us_east_gpu): same checkpoint and revision, region and load test.
+# Streaming cadence keeps SGLang-Omni's own defaults (first chunk 1 frame, ramp 2, 4, then
+# 8-frame chunks at 12.5 frames/s, decoded by its incremental codec); only concurrency is
+# raised to match the vLLM deployment's 64 Stage 0 sequences.
+config_cls: Qwen3TTSPipelineConfig
+model_path: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+stages:
+  tts_engine:
+    engine:
+      max_running_requests: 64
+      cuda_graph_max_bs: 64

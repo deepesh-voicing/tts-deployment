@@ -1,5 +1,10 @@
-"""Create a dedicated US-East CPU Sandbox for the existing load_test.py harness."""
+"""Create a dedicated US-East CPU Sandbox for the existing load_test.py harness.
 
+Repeat ``--env KEY=VALUE`` to point one Sandbox at a specific endpoint, e.g.
+``--env TTS_URL=https://.../v1/audio/speech --env TTS_TRANSPORT=http``.
+"""
+
+import argparse
 import os
 
 import modal
@@ -26,10 +31,19 @@ image = (
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                        help="extra environment variable for the harness; may repeat")
+    args = parser.parse_args()
     values = dotenv_values(".env")
     keys = {name: values.get(name) for name in ("OPENAI_API_KEY", "TTS_API_KEY")}
     if not all(keys.values()):
         raise RuntimeError("OPENAI_API_KEY and TTS_API_KEY are required in local .env")
+    for item in args.env:
+        name, separator, value = item.partition("=")
+        if not separator or not name:
+            parser.error(f"--env expects KEY=VALUE, got {item!r}")
+        keys[name] = value
 
     app = modal.App.lookup(APP_NAME, create_if_missing=True)
     volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
