@@ -41,11 +41,11 @@ def test_vendored_splitter_is_upstream_verbatim():
     assert lines[3] == "# SPDX-License-Identifier: Apache-2.0"
 
 
-def test_realtime_route_uses_the_production_key_secret_and_splitter():
+def test_realtime_route_uses_the_sglang_key_secret_and_splitter():
     source = DEPLOY_PATH.read_text()
 
     assert '@api.websocket("/v1/text-to-speech/{voice_id}/stream-input")' in source
-    assert 'modal.Secret.from_name("qwen-tts-api-keys")' in source
+    assert 'modal.Secret.from_name("qwen-tts-sglang-api-keys")' in source
     assert '"secrets": [huggingface_secret, api_keys_secret]' in source
     assert '"modal_apps/vllm_omni_speech_text_splitter.py"' in source
 
@@ -64,13 +64,17 @@ def test_api_key_matches_the_production_format():
     assert deploy._authenticate_api_key("Bearer qtts_live_demo.wrong", records) is None
 
 
-def test_api_keys_allow_the_production_connection_limit():
+def test_api_keys_allow_the_sglang_connection_limit():
     deploy = _load("deploy_qwen3_tts_sglang", DEPLOY_PATH)
     records = deploy._load_api_key_records(
-        json.dumps({"bot": {"sha256": "0" * 64, "max_connections": 128}})
+        json.dumps({"bot": {"sha256": "0" * 64, "max_connections": 256}})
     )
 
-    assert records["bot"]["max_connections"] == 128
+    assert records["bot"]["max_connections"] == 256
+    with pytest.raises(RuntimeError, match="max_connections must be 1-256"):
+        deploy._load_api_key_records(
+            json.dumps({"bot": {"sha256": "0" * 64, "max_connections": 257}})
+        )
 
 
 def test_relay_streams_clauses_and_keeps_reading_text_during_generation():

@@ -5,10 +5,17 @@
 # Streaming cadence keeps SGLang-Omni's own defaults (first chunk 1 frame, ramp 2, 4, then
 # 8-frame chunks at 12.5 frames/s, decoded by its incremental codec); only concurrency is
 # raised to match the vLLM deployment's 64 Stage 0 sequences.
+#
+# max_queued_requests: the engine default of 16 answers any request beyond 16 waiting for
+# admission with HTTP 503 "The request queue is full", even with running slots free. A burst
+# of ~25 clauses hit it at c48 and c64 on L40S (2026-09-30). Each realtime connection has at
+# most one clause in flight and the API-key cap is 128 connections, so 128 waiting slots
+# mean a burst queues instead of failing. Coordinator in-flight cap = 64 + 128 = 192.
 config_cls: Qwen3TTSPipelineConfig
 model_path: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 stages:
   tts_engine:
     engine:
       max_running_requests: 64
+      max_queued_requests: 128
       cuda_graph_max_bs: 64

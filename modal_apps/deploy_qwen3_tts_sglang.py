@@ -43,8 +43,8 @@ QWEN_TTS_VERSION = "0.1.1"
 GPU = "L40S"
 REGION = "us-east"
 SGLANG_PORT = 8000
-# Realtime WebSocket connections each hold one input; matches the frozen deployment.
-MAX_INPUTS = 128
+# Realtime WebSocket connections each hold one input; sized to MAX_API_KEY_CONNECTIONS.
+MAX_INPUTS = 256
 MAX_CONTAINERS = 1
 SCALEDOWN_WINDOW_SECONDS = 300
 STARTUP_TIMEOUT_SECONDS = 30 * 60
@@ -56,9 +56,10 @@ SAMPLING_DEFAULTS = {"temperature": 0.9, "top_k": 50, "repetition_penalty": 1.05
 
 # Realtime WebSocket limits of the frozen deployment (deploy_qwen3_tts_realtime.py).
 API_KEYS_ENV = "TTS_API_KEYS_JSON"
-# The key records are shared with the frozen deployment, which validates them against its
-# MAX_INPUTS of 128.
-MAX_API_KEY_CONNECTIONS = 128
+# Same keys as the frozen deployment, from its own secret: qwen-tts-api-keys stays capped at
+# 128 connections per key because the frozen deployment rejects records above its MAX_INPUTS
+# of 128, and a c128 load test needs headroom over 128.
+MAX_API_KEY_CONNECTIONS = 256
 MAX_TEXT_MESSAGE_BYTES = 64 * 1024
 MAX_BUFFERED_TEXT_CHARACTERS = 4096
 DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 30
@@ -77,7 +78,7 @@ DEPENDENCY_OVERRIDES_PATH = "/opt/tts/sglang_dependency_overrides.txt"
 
 cache_volume = modal.Volume.from_name("tts-l40s-cache", create_if_missing=True)
 huggingface_secret = modal.Secret.from_name("huggingface-secret")
-api_keys_secret = modal.Secret.from_name("qwen-tts-api-keys")
+api_keys_secret = modal.Secret.from_name("qwen-tts-sglang-api-keys")
 
 image = (
     modal.Image.from_registry(SGLANG_OMNI_IMAGE)
