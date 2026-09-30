@@ -60,8 +60,8 @@ def gpu_slug(gpu: str) -> str:
     return gpu.lower().replace("-", "")
 
 
-def start(gpu: str, timeout_seconds: int = TIMEOUT_SECONDS) -> tuple[modal.Sandbox, str]:
-    """Create the Sandbox and return it with its HTTPS URL once ``/health`` answers."""
+def create(gpu: str, timeout_seconds: int = TIMEOUT_SECONDS) -> modal.Sandbox:
+    """Create the Sandbox without waiting for the API to come up."""
     app = modal.App.lookup(APP_NAME, create_if_missing=True)
     sandbox = modal.Sandbox.create(
         "bash",
@@ -78,19 +78,30 @@ def start(gpu: str, timeout_seconds: int = TIMEOUT_SECONDS) -> tuple[modal.Sandb
         timeout=timeout_seconds,
     )
     print(f"sandbox_id={sandbox.object_id}", flush=True)
+    return sandbox
+
+
+def wait_until_ready(sandbox: modal.Sandbox) -> str:
+    """Return the Sandbox's HTTPS URL once ``/health`` answers."""
+    url = sandbox.tunnels(timeout=READY_TIMEOUT_SECONDS)[PORT].url
+    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if sandbox.poll() is not None:
+            raise RuntimeError("Sandbox exited before the API became ready")
+        try:
+            with urllib.request.urlopen(f"{url}/health", timeout=3) as response:
+                if response.status == 200:
+                    return url
+        except (OSError, urllib.error.URLError):
+            time.sleep(2)
+    raise TimeoutError(f"Sandbox API did not become ready in {READY_TIMEOUT_SECONDS}s")
+
+
+def start(gpu: str, timeout_seconds: int = TIMEOUT_SECONDS) -> tuple[modal.Sandbox, str]:
+    """Create the Sandbox and return it with its HTTPS URL once ``/health`` answers."""
+    sandbox = create(gpu, timeout_seconds)
     try:
-        url = sandbox.tunnels(timeout=READY_TIMEOUT_SECONDS)[PORT].url
-        deadline = time.monotonic() + READY_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            if sandbox.poll() is not None:
-                raise RuntimeError("Sandbox exited before the API became ready")
-            try:
-                with urllib.request.urlopen(f"{url}/health", timeout=3) as response:
-                    if response.status == 200:
-                        return sandbox, url
-            except (OSError, urllib.error.URLError):
-                time.sleep(2)
-        raise TimeoutError(f"Sandbox API did not become ready in {READY_TIMEOUT_SECONDS}s")
+        return sandbox, wait_until_ready(sandbox)
     except BaseException:
         sandbox.terminate()
         raise

@@ -162,6 +162,17 @@ curl --fail-with-body --no-buffer "$CLONE_URL/v1/audio/speech" \
 curl -X DELETE "$CLONE_URL/v1/audio/voices/my-voice"
 ```
 
+For a browser UI (upload or record a sample, add an optional transcript, type
+text and play it back in that voice), run the following from the repository root
+with the Modal CLI's Python. It starts the Sandbox, serves
+`http://127.0.0.1:7860`, and terminates the Sandbox on Ctrl-C. Add
+`--base-url "$CLONE_URL"` to use a running Sandbox instead. That mode only
+deletes the voices it uploaded:
+
+```bash
+/opt/homebrew/Cellar/modal/1.5.5/libexec/bin/python qwen_clone_ui.py
+```
+
 `GET /v1/audio/voices` lists uploaded voices and speaker-cache hits. Only
 uploaded voices are cached. A `ref_audio` sent with each request is re-encoded
 every time.

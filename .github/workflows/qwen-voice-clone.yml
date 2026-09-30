@@ -1,0 +1,122 @@
+# Qwen3-TTS voice cloning on SGLang-Omni (see modal_apps/README.md).
+#
+# - lint: every push/PR that touches the voice-cloning files.
+# - smoke: manual only (Actions -> "Qwen voice clone" -> Run workflow). Starts the clone
+#   Sandbox on one GPU, runs qwen_clone_smoke.py against it, uploads the WAVs and
+#   summary.json, and always terminates the Sandbox.
+#
+# Smoke needs repository secrets MODAL_TOKEN_ID and MODAL_TOKEN_SECRET for a Modal
+# workspace that has the huggingface-secret Secret and the tts-l40s-cache Volume.
+name: Qwen voice clone
+
+on:
+  push:
+    paths:
+      - .github/workflows/qwen-voice-clone.yml
+      - modal_apps/create_qwen3_tts_sglang_clone_sandbox.py
+      - modal_apps/configs/qwen3_tts_clone_sglang.yaml
+      - modal_apps/deploy_qwen3_tts_sglang.py
+      - qwen_clone_smoke.py
+      - qwen_clone_ui.py
+  pull_request:
+    paths:
+      - .github/workflows/qwen-voice-clone.yml
+      - modal_apps/create_qwen3_tts_sglang_clone_sandbox.py
+      - modal_apps/configs/qwen3_tts_clone_sglang.yaml
+      - modal_apps/deploy_qwen3_tts_sglang.py
+      - qwen_clone_smoke.py
+      - qwen_clone_ui.py
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: Modal GPU type
+        default: L40S
+        type: choice
+        options: [L40S, L4, RTX-PRO-6000]
+      text:
+        description: Sentence to synthesize (blank uses the 3 built-in sentences)
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash  # -eo pipefail, so `| tee` keeps the launcher's exit code
+
+jobs:
+  lint:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.16.7
+      - name: Ruff
+        run: |
+          files="modal_apps/create_qwen3_tts_sglang_clone_sandbox.py qwen_clone_smoke.py qwen_clone_ui.py"
+          ruff check $files
+          ruff format --check $files
+
+  smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      # The Sandbox name is fixed per GPU type, so only one run per GPU at a time.
+      group: qwen-voice-clone-${{ inputs.gpu }}
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      # One run needs well under an hour; keep a stray Sandbox from outliving it by much.
+      QWEN_CLONE_SANDBOX_TIMEOUT_SECONDS: "1800"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+          pip install "modal==1.5.5" aiohttp
+
+      - name: Start clone Sandbox
+        id: sandbox
+        run: |
+          python -m modal_apps.create_qwen3_tts_sglang_clone_sandbox --gpu "${{ inputs.gpu }}" \
+            | tee sandbox.log
+          echo "id=$(sed -n 's/^sandbox_id=//p' sandbox.log | tail -1)" >> "$GITHUB_OUTPUT"
+          echo "url=$(sed -n 's/^url=//p' sandbox.log | tail -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Run smoke test
+        env:
+          CLONE_URL: ${{ steps.sandbox.outputs.url }}
+          CLONE_TEXT: ${{ inputs.text }}
+        run: |
+          args=(--base-url "$CLONE_URL" --output-dir clone_smoke)
+          if [ -n "$CLONE_TEXT" ]; then args+=(--text "$CLONE_TEXT"); fi
+          python qwen_clone_smoke.py "${args[@]}"
+          python - <<'EOF'
+          import json
+          results = json.load(open("clone_smoke/summary.json"))["results"]
+          failed = [r for r in results if "error" in r]
+          print(f"{len(results) - len(failed)}/{len(results)} requests succeeded")
+          for r in failed:
+              print(f"::error::{r['case']}[{r['index']}] {r['error']}")
+          raise SystemExit(1 if failed else 0)
+          EOF
+
+      - name: Upload clips and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-voice-clone-${{ inputs.gpu }}-${{ github.run_id }}
+          path: clone_smoke/
+          if-no-files-found: ignore
+
+      - name: Terminate Sandbox
+        if: always() && steps.sandbox.outputs.id != ''
+        run: |
+          python -c "import modal; modal.Sandbox.from_id('${{ steps.sandbox.outputs.id }}').terminate()"
