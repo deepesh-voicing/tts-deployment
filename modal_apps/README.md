@@ -102,3 +102,81 @@ curl --fail-with-body --no-buffer --max-time 120 \
 These native routes do not match the existing load harness's `POST /tts`
 `{"text": ...}` contract. Add a common gateway or provider-aware harness adapter
 before running `load_test.py` against them.
+
+## Qwen3-TTS voice cloning (SGLang-Omni)
+
+Cloning needs the `Qwen/Qwen3-TTS-12Hz-1.7B-Base` checkpoint. The frozen SGLang
+deployment (`deploy_qwen3_tts_sglang.py`) serves CustomVoice and forces
+`task_type: CustomVoice` and `voice: aiden`, so it cannot clone. Instead, a
+separate GPU Sandbox reuses the frozen image and engine settings with the Base
+checkpoint (`configs/qwen3_tts_clone_sglang.yaml`). It serves SGLang-Omni's own
+API at 24 kHz, without the 8 kHz wrapper or API-key auth, and stops itself after
+one hour (`QWEN_CLONE_SANDBOX_TIMEOUT_SECONDS`).
+
+Start it from the repository root with the Modal CLI's Python. The first boot
+downloads the Base checkpoint to `tts-l40s-cache`:
+
+```bash
+/opt/homebrew/Cellar/modal/1.5.5/libexec/bin/python \
+  -m modal_apps.create_qwen3_tts_sglang_clone_sandbox --gpu L40S
+# prints sandbox_id=sb-... and url=https://...modal.host
+```
+
+Run the smoke test. It clones Qwen's public demo reference (`clone.wav` and its
+published transcript) four ways, one request at a time, and writes 24 kHz and
+8 kHz WAVs plus `summary.json` to
+`artifacts_sandbox/qwen_sglang_clone_smoke_<IST time>/`. It needs `ffmpeg`.
+Repeat `--text` to use your own sentences:
+
+```bash
+uv run python qwen_clone_smoke.py --base-url "$CLONE_URL"
+```
+
+| Case | Request fields |
+|---|---|
+| `ref_icl` | `ref_audio` (data URI or URL) + `ref_text` |
+| `ref_xvector` | `ref_audio` + `x_vector_only_mode: true` (no transcript) |
+| `ref_icl_telephony` | as `ref_icl`, reference first squeezed through 8 kHz mu-law |
+| `uploaded_pass*` | `POST /v1/audio/voices` once, then `voice: <name>` |
+
+Per request, by hand:
+
+```bash
+curl --fail-with-body --no-buffer --max-time 120 "$CLONE_URL/v1/audio/speech" \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"model":"Qwen/Qwen3-TTS-12Hz-1.7B-Base","input":"I can help with that request.","ref_audio":"https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav","ref_text":"Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.","stream":true,"response_format":"pcm"}' \
+  --output clone_24k.pcm
+```
+
+Upload once, then synthesize by name. References must be 1-30 s. On a Base
+checkpoint, every `voice` except `default` must be an uploaded voice:
+
+```bash
+curl --fail-with-body "$CLONE_URL/v1/audio/voices" \
+  -F name=my-voice -F consent=<consent-record-id> \
+  -F "ref_text=<exact transcript of the clip>" -F audio_sample=@reference.wav
+curl --fail-with-body --no-buffer "$CLONE_URL/v1/audio/speech" \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"model":"Qwen/Qwen3-TTS-12Hz-1.7B-Base","input":"Hello there.","voice":"my-voice","stream":true,"response_format":"pcm"}' \
+  --output clone_24k.pcm
+curl -X DELETE "$CLONE_URL/v1/audio/voices/my-voice"
+```
+
+`GET /v1/audio/voices` lists uploaded voices and speaker-cache hits. Only
+uploaded voices are cached. A `ref_audio` sent with each request is re-encoded
+every time.
+
+Shut the Sandbox down when finished:
+
+```bash
+/opt/homebrew/Cellar/modal/1.5.5/libexec/bin/python -c \
+  "import modal; modal.Sandbox.from_id('sb-...').terminate()"
+```
+
+First results (2026-09-30, one L40S, measured from a laptop, so the numbers
+include the network round trip): all modes worked. Warm first audio was about
+300 ms for uploaded voices, x-vector and the telephony reference, and about
+330 ms for `ref_icl`. The first request after boot takes about 40 s, and the
+first few `ref_icl` requests are slow (1.4-1.8 s, then about 520 ms). Warm the
+server up before measuring. Outputs begin with 0.1-0.6 s of silence, so speech
+is heard later than the first audio bytes arrive.

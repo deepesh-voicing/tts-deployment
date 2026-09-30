@@ -1,0 +1,13 @@
+# SGLang-Omni 0.1.6 Qwen3-TTS Base (voice cloning) profile for the clone test Sandbox
+# (create_qwen3_tts_sglang_clone_sandbox.py).
+#
+# Same engine settings as the frozen CustomVoice profile (qwen3_tts_sglang.yaml); only the
+# checkpoint changes. The file name deliberately does not start with "qwen3_tts_sglang", so
+# the frozen deployment image, which bakes in configs matching that prefix, is unchanged.
+config_cls: Qwen3TTSPipelineConfig
+model_path: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+stages:
+  tts_engine:
+    engine:
+      max_running_requests: 64
+      cuda_graph_max_bs: 64
